@@ -55,6 +55,22 @@ type ChartRepository struct {
 	CachePath string
 }
 
+// UpdateResult describes the outcome of updating one repository index.
+type UpdateResult struct {
+	// Name is the local name of the repository.
+	Name string
+	// URL is the repository URL.
+	URL string
+	// Err is the error that prevented the index from being updated, or nil
+	// on success.
+	Err error
+}
+
+// Failed reports whether the repository update failed.
+func (r UpdateResult) Failed() bool {
+	return r.Err != nil
+}
+
 // NewChartRepository constructs ChartRepository
 func NewChartRepository(cfg *Entry, getters getter.Providers) (*ChartRepository, error) {
 	u, err := url.Parse(cfg.URL)

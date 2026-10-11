@@ -16,6 +16,7 @@ limitations under the License.
 package downloader
 
 import (
+	"context"
 	"crypto"
 	"encoding/hex"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +59,171 @@ func (e ErrRepoNotFound) Error() string {
 	return "no repository definition for " + strings.Join(e.Repos, ", ")
 }
 
+const (
+	// DefaultDownloadConcurrency is the conservative default upper bound on
+	// how many dependencies are downloaded at the same time.
+	DefaultDownloadConcurrency = 4
+
+	// DefaultDownloadRetries is the default number of additional attempts made
+	// after a transient download failure.
+	DefaultDownloadRetries = 2
+
+	// DefaultRetryInterval is the default amount of time waited between
+	// download attempts.
+	DefaultRetryInterval = 5 * time.Second
+)
+
+// DependencyStatus describes the outcome of processing a single dependency.
+type DependencyStatus int
+
+const (
+	// DependencySucceeded indicates the dependency was downloaded, archived or
+	// validated successfully.
+	DependencySucceeded DependencyStatus = iota + 1
+	// DependencySkipped indicates the dependency was satisfied by another
+	// dependency referencing the same source and did not need downloading.
+	DependencySkipped
+	// DependencyFailed indicates the dependency could not be processed.
+	DependencyFailed
+	// DependencyNotStarted indicates processing was cancelled before the
+	// dependency could start.
+	DependencyNotStarted
+)
+
+// String returns a human readable status.
+func (s DependencyStatus) String() string {
+	switch s {
+	case DependencySucceeded:
+		return "succeeded"
+	case DependencySkipped:
+		return "skipped"
+	case DependencyFailed:
+		return "failed"
+	case DependencyNotStarted:
+		return "not started"
+	default:
+		return "unknown"
+	}
+}
+
+// DependencyResult captures the outcome of processing one dependency.
+type DependencyResult struct {
+	// Name is the dependency chart name.
+	Name string
+	// Repository is the declared source: a repository URL, a file:// URL, or
+	// empty for a chart expected in the charts directory.
+	Repository string
+	// Version is the requested version or version constraint.
+	Version string
+	// Status is the outcome.
+	Status DependencyStatus
+	// Reason is a short explanation for non-success statuses.
+	Reason string
+	// Err is the failure cause for DependencyFailed dependencies.
+	Err error
+}
+
+// ErrDependencyDownloads aggregates the per-dependency results of a dependency
+// download run. It is returned when at least one dependency failed or could
+// not be started.
+type ErrDependencyDownloads struct {
+	// Results holds the result of every dependency in declaration order.
+	Results []DependencyResult
+}
+
+// Failed returns the results of dependencies that failed or never started.
+func (e *ErrDependencyDownloads) Failed() []DependencyResult {
+	failed := []DependencyResult{}
+	for _, r := range e.Results {
+		if r.Status == DependencyFailed || r.Status == DependencyNotStarted {
+			failed = append(failed, r)
+		}
+	}
+	return failed
+}
+
+// Error implements the error interface.
+//
+// Every failed dependency is listed with its name, requested version,
+// declared source and failure reason, even when only a single dependency
+// failed.
+func (e *ErrDependencyDownloads) Error() string {
+	failed := e.Failed()
+	var b strings.Builder
+	fmt.Fprintf(&b, "failed to process %d chart %s:", len(failed), pluralDependency(len(failed)))
+	for _, r := range failed {
+		repository := r.Repository
+		if repository == "" {
+			repository = "(charts directory)"
+		}
+		reason := r.Reason
+		if r.Err != nil {
+			reason = r.Err.Error()
+		}
+		fmt.Fprintf(&b, "\n- %q version %q from %s: %s", r.Name, r.Version, repository, reason)
+	}
+	return b.String()
+}
+
+func pluralDependency(n int) string {
+	if n == 1 {
+		return "dependency"
+	}
+	return "dependencies"
+}
+
+// ErrRepositoryUpdates is returned when one or more chart repository indexes
+// could not be updated.
+type ErrRepositoryUpdates struct {
+	// Results holds the result of every repository update in input order.
+	Results []repo.UpdateResult
+}
+
+// NewRepositoryUpdateError builds an error from repository update results. It
+// returns nil when every repository was updated successfully.
+func NewRepositoryUpdateError(results []repo.UpdateResult) error {
+	for _, r := range results {
+		if r.Failed() {
+			return &ErrRepositoryUpdates{Results: results}
+		}
+	}
+	return nil
+}
+
+// Failed returns the per-repository failures, sorted by repository name for
+// stable output.
+func (e *ErrRepositoryUpdates) Failed() []repo.UpdateResult {
+	failed := []repo.UpdateResult{}
+	for _, r := range e.Results {
+		if r.Failed() {
+			failed = append(failed, r)
+		}
+	}
+	sort.Slice(failed, func(i, j int) bool {
+		if failed[i].Name != failed[j].Name {
+			return failed[i].Name < failed[j].Name
+		}
+		return failed[i].URL < failed[j].URL
+	})
+	return failed
+}
+
+// AllFailed reports whether every attempted repository update failed.
+func (e *ErrRepositoryUpdates) AllFailed() bool {
+	return len(e.Results) > 0 && len(e.Failed()) == len(e.Results)
+}
+
+// Error implements the error interface.
+func (e *ErrRepositoryUpdates) Error() string {
+	failed := e.Failed()
+	var b strings.Builder
+	b.WriteString("failed to update the following repositories:")
+	for _, r := range failed {
+		fmt.Fprintf(&b, "\n\t- %q (%s): %v", r.Name, r.URL, r.Err)
+	}
+	return b.String()
+}
+
 // Manager handles the lifecycle of fetching, resolving, and storing dependencies.
 type Manager struct {
 	// Out is used to print warnings and notifications.
@@ -81,6 +248,22 @@ type Manager struct {
 	ContentCache string
 	// SourceDateEpoch, when set, normalizes chart timestamps for reproducible archives.
 	SourceDateEpoch *time.Time
+
+	// Concurrency limits the number of dependencies downloaded in parallel.
+	// Values below 1 fall back to DefaultDownloadConcurrency.
+	Concurrency int
+	// MaxRetries is the number of additional attempts made after a transient
+	// download failure. Zero disables retries.
+	MaxRetries int
+	// RetryInterval is the time waited between download attempts. Values at or
+	// below zero fall back to DefaultRetryInterval.
+	RetryInterval time.Duration
+	// Context is used to cancel dependency processing. When nil a background
+	// context is used. After cancellation no further downloads are started.
+	Context context.Context
+
+	// outMu serializes writes to Out from concurrent workers.
+	outMu sync.Mutex
 }
 
 // Build rebuilds a local charts directory from a lockfile.
@@ -138,15 +321,22 @@ func (m *Manager) Build() error {
 		return err
 	}
 
+	var errs []error
 	if !m.SkipUpdate {
-		// For each repo in the file, update the cached copy of that repo
+		// For each repo in the file, update the cached copy of that repo.
+		// Partial repository update failures are collected rather than
+		// aborting, as cached indexes may still satisfy the build.
 		if err := m.UpdateRepositories(); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
 
-	// Now we need to fetch every package here into charts/
-	return m.downloadAll(lock.Dependencies)
+	// Now we need to fetch every package here into charts/. Successful
+	// downloads are moved into charts/ even when another dependency fails.
+	if err := m.downloadAll(lock.Dependencies); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // Update updates a local charts directory.
@@ -155,6 +345,8 @@ func (m *Manager) Build() error {
 // negotiate versions based on that. It will download the versions
 // from remote chart repositories unless SkipUpdate is true.
 func (m *Manager) Update() error {
+	ctx := m.context()
+
 	c, err := m.loadChartDir()
 	if err != nil {
 		return err
@@ -166,6 +358,8 @@ func (m *Manager) Update() error {
 	if req == nil {
 		return nil
 	}
+
+	var errs []error
 
 	// Get the names of the repositories the dependencies need that Helm is
 	// configured to know about.
@@ -182,16 +376,17 @@ func (m *Manager) Update() error {
 	// adding them automatically. They should have to add them in order to make
 	// sure they are aware of the repositories and opt-in to any locations, for
 	// security.
-	repoNames, err = m.ensureMissingRepos(repoNames, req)
+	repoNames, err = m.ensureMissingRepos(ctx, repoNames, req)
 	if err != nil {
-		return err
+		errs = append(errs, err)
 	}
 
 	// For each of the repositories Helm is configured to know about, update
-	// the index information locally.
+	// the index information locally. Partial failures do not prevent the
+	// cached indexes from being used; they are reported in the final error.
 	if !m.SkipUpdate {
 		if err := m.UpdateRepositories(); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
 
@@ -199,29 +394,94 @@ func (m *Manager) Update() error {
 	// dependencies in the Chart.yaml
 	lock, err := m.resolve(req, repoNames)
 	if err != nil {
-		return err
+		errs = append(errs, err)
+		return errors.Join(errs...)
 	}
 
-	// Now we need to fetch every package here into charts/
+	// Now we need to fetch every package here into charts/. A failure for
+	// one dependency does not stop the remaining dependencies from being
+	// downloaded and moved into charts/.
 	if err := m.downloadAll(lock.Dependencies); err != nil {
-		return err
+		// Downloads are incomplete: keep the existing lock file, but still
+		// surface any repository update failures.
+		errs = append(errs, err)
+		return errors.Join(errs...)
 	}
 
 	// downloadAll might overwrite dependency version, recalculate lock digest
 	newDigest, err := resolver.HashReq(req, lock.Dependencies)
 	if err != nil {
-		return err
+		errs = append(errs, err)
+		return errors.Join(errs...)
 	}
 	lock.Digest = newDigest
 
 	// If the lock file hasn't changed, don't write a new one.
 	oldLock := c.Lock
-	if oldLock != nil && oldLock.Digest == lock.Digest {
-		return nil
+	if oldLock == nil || oldLock.Digest != lock.Digest {
+		// Finally, we need to write the lockfile.
+		if err := writeLock(m.ChartPath, lock, c.Metadata.APIVersion == chart.APIVersionV1); err != nil {
+			errs = append(errs, err)
+		}
 	}
+	return errors.Join(errs...)
+}
 
-	// Finally, we need to write the lockfile.
-	return writeLock(m.ChartPath, lock, c.Metadata.APIVersion == chart.APIVersionV1)
+// context returns the context used for cancellable processing.
+func (m *Manager) context() context.Context {
+	if m.Context != nil {
+		return m.Context
+	}
+	return context.Background()
+}
+
+// logf serializes writes to Out so concurrent workers do not interleave.
+func (m *Manager) logf(format string, args ...any) {
+	m.outMu.Lock()
+	defer m.outMu.Unlock()
+	fmt.Fprintf(m.Out, format, args...)
+}
+
+// synchronizedWriter wraps an io.Writer serializing concurrent writes using
+// the Manager's output mutex.
+func (m *Manager) synchronizedWriter() io.Writer {
+	return &mutexWriter{w: m.Out, mu: &m.outMu}
+}
+
+type mutexWriter struct {
+	w  io.Writer
+	mu *sync.Mutex
+}
+
+func (l *mutexWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+// downloadConcurrency returns the configured parallelism or the default.
+func (m *Manager) downloadConcurrency() int {
+	if m.Concurrency > 0 {
+		return m.Concurrency
+	}
+	return DefaultDownloadConcurrency
+}
+
+// maxAttempts returns the total number of download attempts (the initial
+// attempt plus retries).
+func (m *Manager) maxAttempts() int {
+	if m.MaxRetries < 0 {
+		return DefaultDownloadRetries + 1
+	}
+	return m.MaxRetries + 1
+}
+
+// retryInterval returns the configured retry interval or the default.
+func (m *Manager) retryInterval() time.Duration {
+	if m.RetryInterval > 0 {
+		return m.RetryInterval
+	}
+	return DefaultRetryInterval
 }
 
 func (m *Manager) loadChartDir() (*chart.Chart, error) {
@@ -243,16 +503,23 @@ func (m *Manager) resolve(req []*chart.Dependency, repoNames map[string]string) 
 
 // downloadAll takes a list of dependencies and downloads them into charts/
 //
+// Dependencies are processed with bounded concurrency (see Manager.Concurrency)
+// and each one is recorded independently: a failure for one dependency does
+// not stop the remaining dependencies from being downloaded and moved into
+// charts/. Dependencies that resolve to the same source are downloaded once.
+// Transient download failures are retried (see Manager.MaxRetries).
+//
 // It will delete versions of the chart that exist on disk and might cause
 // a conflict.
 func (m *Manager) downloadAll(deps []*chart.Dependency) error {
+	ctx := m.context()
+
 	repos, err := m.loadChartRepositories()
 	if err != nil {
 		return err
 	}
 
 	destPath := filepath.Join(m.ChartPath, "charts")
-	tmpPath := filepath.Join(m.ChartPath, fmt.Sprintf("tmpcharts-%d", os.Getpid()))
 
 	// Check if 'charts' directory is not actually a directory. If it does not exist, create it.
 	if fi, err := os.Stat(destPath); err == nil {
@@ -267,113 +534,355 @@ func (m *Manager) downloadAll(deps []*chart.Dependency) error {
 		return fmt.Errorf("unable to retrieve file info for '%s': %w", destPath, err)
 	}
 
-	// Prepare tmpPath
-	if err := os.MkdirAll(tmpPath, 0o755); err != nil {
+	// Use a unique temp directory per invocation so repeated updates within the
+	// same process (and concurrent updates) cannot interfere with each other.
+	tmpPath, err := os.MkdirTemp(m.ChartPath, "tmpcharts-*")
+	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpPath)
 
 	fmt.Fprintf(m.Out, "Saving %d charts\n", len(deps))
-	var saveError error
-	churls := make(map[string]struct{})
-	for _, dep := range deps {
-		// No repository means the chart is in charts directory
-		if dep.Repository == "" {
-			fmt.Fprintf(m.Out, "Dependency %s did not declare a repository. Assuming it exists in the charts directory\n", dep.Name)
-			// NOTE: we are only validating the local dependency conforms to the constraints. No copying to tmpPath is necessary.
-			chartPath := filepath.Join(destPath, dep.Name)
-			ch, err := loader.LoadDir(chartPath)
-			if err != nil {
-				return fmt.Errorf("unable to load chart '%s': %w", chartPath, err)
-			}
 
-			constraint, err := semver.NewConstraint(dep.Version)
-			if err != nil {
-				return fmt.Errorf("dependency %s has an invalid version/constraint format: %w", dep.Name, err)
-			}
-
-			v, err := semver.NewVersion(ch.Metadata.Version)
-			if err != nil {
-				return fmt.Errorf("invalid version %s for dependency %s: %w", dep.Version, dep.Name, err)
-			}
-
-			if !constraint.Check(v) {
-				saveError = fmt.Errorf("dependency %s at version %s does not satisfy the constraint %s", dep.Name, ch.Metadata.Version, dep.Version)
-				break
-			}
-			continue
+	results := make([]DependencyResult, len(deps))
+	for i, dep := range deps {
+		results[i] = DependencyResult{
+			Name:       dep.Name,
+			Repository: dep.Repository,
+			Version:    dep.Version,
+			Status:     DependencyNotStarted,
+			Reason:     "download did not start",
 		}
-		if strings.HasPrefix(dep.Repository, "file://") {
-			if m.Debug {
-				fmt.Fprintf(m.Out, "Archiving %s from repo %s\n", dep.Name, dep.Repository)
+	}
+
+	jobs := &dependencyJobs{
+		m:        m,
+		out:      m.synchronizedWriter(),
+		repos:    repos,
+		tmpPath:  tmpPath,
+		destPath: destPath,
+		remote:   map[string]*downloadSlot{},
+		archived: map[string]*downloadSlot{},
+	}
+
+	concurrency := min(m.downloadConcurrency(), len(deps))
+	// A semaphore bounds the number of in-flight dependencies. Workers are
+	// launched in dependency declaration order, so with concurrency one the
+	// output ordering is identical to a purely sequential run.
+	sem := make(chan struct{}, concurrency)
+
+	var wg sync.WaitGroup
+submission:
+	for i, dep := range deps {
+		// Do not start anything new when the context is already cancelled.
+		select {
+		case <-ctx.Done():
+			for j := i; j < len(deps); j++ {
+				results[j] = notStartedResult(deps[j], ctx.Err())
 			}
-			ver, err := tarFromLocalDir(m.ChartPath, dep.Name, dep.Repository, dep.Version, tmpPath, m.SourceDateEpoch)
-			if err != nil {
-				saveError = err
-				break
-			}
-			dep.Version = ver
-			continue
+			break submission
+		default:
 		}
 
-		// Any failure to resolve/download a chart should fail:
-		// https://github.com/helm/helm/issues/1439
-		churl, username, password, insecureSkipTLSVerify, passCredentialsAll, caFile, certFile, keyFile, err := m.findChartURL(dep.Name, dep.Version, dep.Repository, repos)
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			// Cancellation: leave every dependency that has not been handed
+			// to a worker marked as not started and launch nothing new.
+			for j := i; j < len(deps); j++ {
+				results[j] = notStartedResult(deps[j], ctx.Err())
+			}
+			break submission
+		}
+
+		wg.Add(1)
+		go func(i int, dep *chart.Dependency) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = jobs.process(ctx, dep)
+		}(i, dep)
+	}
+	wg.Wait()
+
+	// On cancellation publish nothing: leave charts/ untouched and let the
+	// deferred cleanup remove the temp directory so no half-finished
+	// artifacts remain.
+	if ctx.Err() != nil {
+		for i := range results {
+			if results[i].Status == DependencyNotStarted && results[i].Err == nil {
+				results[i] = notStartedResult(deps[i], ctx.Err())
+			}
+		}
+		return newDependencyDownloadsError(results)
+	}
+
+	// Move all successfully downloaded charts to destPath and delete outdated
+	// dependencies. This runs even when some dependencies failed so successful
+	// downloads can be reused by the next run.
+	if err := m.safeMoveDeps(results, deps, tmpPath, destPath); err != nil {
+		return err
+	}
+
+	if dlErr := newDependencyDownloadsError(results); dlErr != nil {
+		fmt.Fprintf(m.Out, "Save error occurred:  %s\n", dlErr)
+		return dlErr
+	}
+	return nil
+}
+
+// newDependencyDownloadsError builds an aggregate error from per-dependency
+// results, or returns nil when every dependency succeeded or was skipped.
+func newDependencyDownloadsError(results []DependencyResult) error {
+	for _, r := range results {
+		if r.Status == DependencyFailed || r.Status == DependencyNotStarted {
+			return &ErrDependencyDownloads{Results: results}
+		}
+	}
+	return nil
+}
+
+// notStartedResult records a dependency that was not handed to a worker,
+// typically because processing was cancelled.
+func notStartedResult(dep *chart.Dependency, cause error) DependencyResult {
+	return DependencyResult{
+		Name:       dep.Name,
+		Repository: dep.Repository,
+		Version:    dep.Version,
+		Status:     DependencyNotStarted,
+		Reason:     "canceled before the download started",
+		Err:        fmt.Errorf("dependency %q was not started: %w", dep.Name, cause),
+	}
+}
+
+// downloadSlot coordinates dependencies that resolve to the same source. The
+// first dependency (the leader) performs the work; followers wait for its
+// outcome instead of downloading again.
+type downloadSlot struct {
+	done    chan struct{}
+	result  DependencyResult
+	version string
+}
+
+// dependencyJobs runs the per-dependency download pipeline for a single
+// downloadAll invocation.
+type dependencyJobs struct {
+	m                 *Manager
+	out               io.Writer
+	repos             map[string]*repo.ChartRepository
+	tmpPath, destPath string
+	mu                sync.Mutex
+	remote            map[string]*downloadSlot
+	archived          map[string]*downloadSlot
+}
+
+// acquire returns the slot for the given key and whether it already existed.
+func (j *dependencyJobs) acquire(table map[string]*downloadSlot, key string) (*downloadSlot, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if s, ok := table[key]; ok {
+		return s, true
+	}
+	s := &downloadSlot{done: make(chan struct{})}
+	table[key] = s
+	return s, false
+}
+
+// process handles one dependency and records its result.
+func (j *dependencyJobs) process(ctx context.Context, dep *chart.Dependency) DependencyResult {
+	switch {
+	case dep.Repository == "":
+		// No repository means the chart is expected in the charts directory.
+		return j.processLocal(dep)
+	case strings.HasPrefix(dep.Repository, "file://"):
+		return j.processArchive(ctx, dep)
+	default:
+		return j.processRemote(ctx, dep)
+	}
+}
+
+// resultFor builds the base result for a dependency. The requested version is
+// recorded before processing may normalize it (e.g. by archiving a local
+// chart satisfying a range constraint).
+func resultFor(dep *chart.Dependency, requestedVersion string, status DependencyStatus, reason string, err error) DependencyResult {
+	return DependencyResult{
+		Name:       dep.Name,
+		Repository: dep.Repository,
+		Version:    requestedVersion,
+		Status:     status,
+		Reason:     reason,
+		Err:        err,
+	}
+}
+
+// processLocal validates a chart expected to already exist as a directory in
+// charts/.
+func (j *dependencyJobs) processLocal(dep *chart.Dependency) DependencyResult {
+	requested := dep.Version
+	j.m.logf("Dependency %s did not declare a repository. Assuming it exists in the charts directory\n", dep.Name)
+	// NOTE: we are only validating the local dependency conforms to the
+	// constraints. No copying to tmpPath is necessary.
+	chartPath := filepath.Join(j.destPath, dep.Name)
+	ch, err := loader.LoadDir(chartPath)
+	if err != nil {
+		return resultFor(dep, requested, DependencyFailed, "", fmt.Errorf("unable to load chart '%s': %w", chartPath, err))
+	}
+
+	constraint, err := semver.NewConstraint(dep.Version)
+	if err != nil {
+		return resultFor(dep, requested, DependencyFailed, "", fmt.Errorf("dependency %s has an invalid version/constraint format: %w", dep.Name, err))
+	}
+
+	v, err := semver.NewVersion(ch.Metadata.Version)
+	if err != nil {
+		return resultFor(dep, requested, DependencyFailed, "", fmt.Errorf("invalid version %s for dependency %s: %w", dep.Version, dep.Name, err))
+	}
+
+	if !constraint.Check(v) {
+		return resultFor(dep, requested, DependencyFailed, "",
+			fmt.Errorf("dependency %s at version %s does not satisfy the constraint %s", dep.Name, ch.Metadata.Version, dep.Version))
+	}
+	return resultFor(dep, requested, DependencySucceeded, "", nil)
+}
+
+// processArchive archives a file:// dependency into the temp directory.
+func (j *dependencyJobs) processArchive(_ context.Context, dep *chart.Dependency) DependencyResult {
+	requested := dep.Version
+	if j.m.Debug {
+		j.m.logf("Archiving %s from repo %s\n", dep.Name, dep.Repository)
+	}
+
+	slot, existed := j.acquire(j.archived, dep.Repository+"|"+dep.Name)
+	if existed {
+		return j.awaitSlot(slot, dep, requested)
+	}
+
+	ver, err := tarFromLocalDir(j.m.ChartPath, dep.Name, dep.Repository, dep.Version, j.tmpPath, j.m.SourceDateEpoch)
+	if err != nil {
+		res := resultFor(dep, requested, DependencyFailed, "", err)
+		slot.result = res
+		close(slot.done)
+		return res
+	}
+	dep.Version = ver
+	slot.version = ver
+	res := resultFor(dep, requested, DependencySucceeded, "", nil)
+	slot.result = res
+	close(slot.done)
+	return res
+}
+
+// processRemote resolves and downloads a repository or OCI dependency.
+func (j *dependencyJobs) processRemote(ctx context.Context, dep *chart.Dependency) DependencyResult {
+	requested := dep.Version
+
+	// Any failure to resolve/download a chart should fail:
+	// https://github.com/helm/helm/issues/1439
+	churl, username, password, insecureSkipTLSVerify, passCredentialsAll, caFile, certFile, keyFile, err :=
+		j.m.findChartURL(dep.Name, dep.Version, dep.Repository, j.repos)
+	if err != nil {
+		return resultFor(dep, requested, DependencyFailed, "", fmt.Errorf("could not find %s: %w", churl, err))
+	}
+
+	version := ""
+	isOCI := registry.IsOCI(churl)
+	if isOCI {
+		churl, version, err = parseOCIRef(churl)
 		if err != nil {
-			saveError = fmt.Errorf("could not find %s: %w", churl, err)
-			break
+			return resultFor(dep, requested, DependencyFailed, "", fmt.Errorf("could not parse OCI reference: %w", err))
 		}
+	}
 
-		if _, ok := churls[churl]; ok {
-			fmt.Fprintf(m.Out, "Already downloaded %s from repo %s\n", dep.Name, dep.Repository)
-			continue
-		}
+	slot, existed := j.acquire(j.remote, churl)
+	if existed {
+		return j.awaitSlot(slot, dep, requested)
+	}
 
-		fmt.Fprintf(m.Out, "Downloading %s from repo %s\n", dep.Name, dep.Repository)
+	j.m.logf("Downloading %s from repo %s\n", dep.Name, dep.Repository)
 
-		dl := ChartDownloader{
-			Out:              m.Out,
-			Verify:           m.Verify,
-			Keyring:          m.Keyring,
-			RepositoryConfig: m.RepositoryConfig,
-			RepositoryCache:  m.RepositoryCache,
-			ContentCache:     m.ContentCache,
-			RegistryClient:   m.RegistryClient,
-			Getters:          m.Getters,
-			Options: []getter.Option{
-				getter.WithBasicAuth(username, password),
-				getter.WithPassCredentialsAll(passCredentialsAll),
-				getter.WithInsecureSkipVerifyTLS(insecureSkipTLSVerify),
-				getter.WithTLSClientConfig(certFile, keyFile, caFile),
-			},
-		}
+	dl := ChartDownloader{
+		Out:              j.out,
+		Verify:           j.m.Verify,
+		Keyring:          j.m.Keyring,
+		RepositoryConfig: j.m.RepositoryConfig,
+		RepositoryCache:  j.m.RepositoryCache,
+		ContentCache:     j.m.ContentCache,
+		RegistryClient:   j.m.RegistryClient,
+		Getters:          j.m.Getters,
+		Options: []getter.Option{
+			getter.WithBasicAuth(username, password),
+			getter.WithPassCredentialsAll(passCredentialsAll),
+			getter.WithInsecureSkipVerifyTLS(insecureSkipTLSVerify),
+			getter.WithTLSClientConfig(certFile, keyFile, caFile),
+		},
+	}
+	if isOCI {
+		dl.Options = append(dl.Options,
+			getter.WithRegistryClient(j.m.RegistryClient),
+			getter.WithTagName(version))
+	}
 
-		version := ""
-		if registry.IsOCI(churl) {
-			churl, version, err = parseOCIRef(churl)
-			if err != nil {
-				return fmt.Errorf("could not parse OCI reference: %w", err)
+	if err := j.m.downloadToWithRetry(ctx, &dl, churl, version, j.tmpPath, dep.Name); err != nil {
+		res := resultFor(dep, requested, DependencyFailed, "", fmt.Errorf("could not download %s: %w", churl, err))
+		slot.result = res
+		close(slot.done)
+		return res
+	}
+
+	res := resultFor(dep, requested, DependencySucceeded, "", nil)
+	slot.result = res
+	close(slot.done)
+	return res
+}
+
+// awaitSlot waits for a leader slot and reports the dependency as skipped when
+// the shared source was already handled successfully.
+func (j *dependencyJobs) awaitSlot(slot *downloadSlot, dep *chart.Dependency, requestedVersion string) DependencyResult {
+	<-slot.done
+	j.m.logf("Already downloaded %s from repo %s\n", dep.Name, dep.Repository)
+	if slot.version != "" {
+		dep.Version = slot.version
+	}
+	if slot.result.Status != DependencySucceeded {
+		return resultFor(dep, requestedVersion, DependencyFailed, "",
+			fmt.Errorf("shared source download failed: %w", slot.result.Err))
+	}
+	return resultFor(dep, requestedVersion, DependencySkipped, "already downloaded from the same source", nil)
+}
+
+// downloadToWithRetry downloads a chart, retrying transient failures a bounded
+// number of times with a fixed interval. Deterministic failures (resolution,
+// verification, HTTP client errors other than 429/5xx) are not retried, so the
+// existing cache, digest and provenance rules remain unchanged.
+func (m *Manager) downloadToWithRetry(ctx context.Context, dl *ChartDownloader, ref, version, dest, name string) error {
+	maxAttempts := m.maxAttempts()
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			m.logf("Warning: download of %s failed: %v. Retrying in %s (attempt %d/%d).\n",
+				name, err, m.retryInterval(), attempt, maxAttempts)
+			select {
+			case <-time.After(m.retryInterval()):
+			case <-ctx.Done():
+				return ctx.Err()
 			}
-			dl.Options = append(dl.Options,
-				getter.WithRegistryClient(m.RegistryClient),
-				getter.WithTagName(version))
 		}
 
-		if _, _, err = dl.DownloadTo(churl, version, tmpPath); err != nil {
-			saveError = fmt.Errorf("could not download %s: %w", churl, err)
-			break
+		// DownloadTo is not context-aware; cancellation is honored around
+		// this call (no new downloads start, retry backoffs are interrupted).
+		if _, _, err = dl.DownloadTo(ref, version, dest); err == nil { //nolint:contextcheck
+			return nil
 		}
 
-		churls[churl] = struct{}{}
+		// Do not retry on cancellation or non-transient errors; do not retry
+		// once all attempts are spent.
+		if ctx.Err() != nil || !isRetryableDownloadError(err) || attempt == maxAttempts {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
 	}
-
-	// TODO: this should probably be refactored to be a []error, so we can capture and provide more information rather than "last error wins".
-	if saveError != nil {
-		fmt.Fprintln(m.Out, "Save error occurred: ", saveError)
-		return saveError
-	}
-	// now we can move all downloaded charts to destPath and delete outdated dependencies
-	return m.safeMoveDeps(deps, tmpPath, destPath)
+	return err
 }
 
 func parseOCIRef(chartRef string) (string, string, error) {
@@ -393,15 +902,18 @@ func parseOCIRef(chartRef string) (string, string, error) {
 // It does this by first matching the file name to an expected pattern, then loading
 // the file to verify that it is a chart.
 //
-// Any charts in dest that do not exist in source are removed (barring local dependencies)
+// Any charts in dest that do not exist in source are removed (barring local
+// dependencies and dependencies that were not updated successfully during this
+// run, whose previous artifacts are preserved for the next run to reuse)
 //
 // Because it requires tar file introspection, it is more intensive than a basic move.
 //
 // This will only return errors that should stop processing entirely. Other errors
 // will emit log messages or be ignored.
-func (m *Manager) safeMoveDeps(deps []*chart.Dependency, source, dest string) error {
+func (m *Manager) safeMoveDeps(results []DependencyResult, deps []*chart.Dependency, source, dest string) error {
 	existsInSourceDirectory := map[string]bool{}
 	isLocalDependency := map[string]bool{}
+	statusByName := map[string]DependencyStatus{}
 	sourceFiles, err := os.ReadDir(source)
 	if err != nil {
 		return err
@@ -415,6 +927,15 @@ func (m *Manager) safeMoveDeps(deps []*chart.Dependency, source, dest string) er
 	for _, dep := range deps {
 		if dep.Repository == "" {
 			isLocalDependency[dep.Name] = true
+		}
+	}
+	for _, r := range results {
+		// When a name appears more than once (same source referenced by
+		// several dependencies) a successful result keeps cleanup active.
+		if r.Status == DependencySucceeded || r.Status == DependencySkipped {
+			statusByName[r.Name] = DependencySucceeded
+		} else if _, ok := statusByName[r.Name]; !ok {
+			statusByName[r.Name] = r.Status
 		}
 	}
 
@@ -451,6 +972,11 @@ func (m *Manager) safeMoveDeps(deps []*chart.Dependency, source, dest string) er
 		}
 		// local dependency - skip
 		if isLocalDependency[ch.Name()] {
+			continue
+		}
+		// The dependency failed or was never started in this run: keep the
+		// previously downloaded artifact so a later run can reuse it.
+		if status, known := statusByName[ch.Name()]; known && status != DependencySucceeded {
 			continue
 		}
 		if err := os.Remove(fname); err != nil {
@@ -501,7 +1027,7 @@ Loop:
 // to work with along with the chart dependencies. It will find the deps not
 // in a known repo and attempt to ensure the data is present for steps like
 // version resolution.
-func (m *Manager) ensureMissingRepos(repoNames map[string]string, deps []*chart.Dependency) (map[string]string, error) {
+func (m *Manager) ensureMissingRepos(ctx context.Context, repoNames map[string]string, deps []*chart.Dependency) (map[string]string, error) {
 	var ru []*repo.Entry
 
 	for _, dd := range deps {
@@ -545,10 +1071,11 @@ func (m *Manager) ensureMissingRepos(repoNames map[string]string, deps []*chart.
 	// Calls to UpdateRepositories (a public function) will only update
 	// repositories configured by the user. Here we update repos found in
 	// the dependencies that are not known to the user if update skipping
-	// is not configured.
+	// is not configured. Failures are returned as structured per-repository
+	// results but do not prevent the caller from using cached indexes.
 	if !m.SkipUpdate && len(ru) > 0 {
-		fmt.Fprintln(m.Out, "Getting updates for unmanaged Helm repositories...")
-		if err := m.parallelRepoUpdate(ru); err != nil {
+		m.logf("Getting updates for unmanaged Helm repositories...\n")
+		if err := NewRepositoryUpdateError(m.parallelRepoUpdate(ctx, ru)); err != nil {
 			return repoNames, err
 		}
 	}
@@ -644,6 +1171,11 @@ repository, use "https://charts.example.com/" or "@example" instead of
 }
 
 // UpdateRepositories updates all of the local repos to the latest.
+//
+// Every repository is attempted. The returned error is nil on full success
+// and otherwise an *ErrRepositoryUpdates with a structured result for each
+// repository, so partial and total failures can be distinguished by the
+// caller.
 func (m *Manager) UpdateRepositories() error {
 	rf, err := loadRepoConfig(m.RepositoryConfig)
 	if err != nil {
@@ -651,67 +1183,83 @@ func (m *Manager) UpdateRepositories() error {
 	}
 	repos := rf.Repositories
 	if len(repos) > 0 {
-		fmt.Fprintln(m.Out, "Hang tight while we grab the latest from your chart repositories...")
-		// This prints warnings straight to out.
-		if err := m.parallelRepoUpdate(repos); err != nil {
-			return err
+		m.logf("Hang tight while we grab the latest from your chart repositories...\n")
+		results := m.parallelRepoUpdate(m.context(), repos)
+		if updateErr := NewRepositoryUpdateError(results); updateErr != nil {
+			return updateErr
 		}
-		fmt.Fprintln(m.Out, "Update Complete. ⎈Happy Helming!⎈")
+		m.logf("Update Complete. ⎈Happy Helming!⎈\n")
 	}
 	return nil
 }
 
 // Filter out duplicate repos by URL, including those with trailing slashes.
+// Input order is preserved; on a duplicate the last entry wins.
 func dedupeRepos(repos []*repo.Entry) []*repo.Entry {
-	seen := make(map[string]*repo.Entry)
+	index := make(map[string]int)
+	var unique []*repo.Entry
 	for _, r := range repos {
 		// Normalize URL by removing trailing slashes.
 		seenURL := strings.TrimSuffix(r.URL, "/")
-		seen[seenURL] = r
-	}
-	var unique []*repo.Entry
-	for _, r := range seen {
+		if pos, ok := index[seenURL]; ok {
+			unique[pos] = r // last one wins
+			continue
+		}
+		index[seenURL] = len(unique)
 		unique = append(unique, r)
 	}
 	return unique
 }
 
-func (m *Manager) parallelRepoUpdate(repos []*repo.Entry) error {
-	var wg sync.WaitGroup
-
+// parallelRepoUpdate updates the index files of the given repositories
+// concurrently and returns a structured result for each of them, in input
+// order. A failure for one repository does not prevent the others from being
+// updated. After ctx is cancelled no new update is started.
+func (m *Manager) parallelRepoUpdate(ctx context.Context, repos []*repo.Entry) []repo.UpdateResult {
 	localRepos := dedupeRepos(repos)
+	results := make([]repo.UpdateResult, len(localRepos))
 
-	for _, c := range localRepos {
+	var wg sync.WaitGroup
+	for i, c := range localRepos {
+		if err := ctx.Err(); err != nil {
+			results[i] = repo.UpdateResult{Name: c.Name, URL: c.URL, Err: err}
+			continue
+		}
+
 		r, err := repo.NewChartRepository(c, m.Getters)
 		if err != nil {
-			return err
+			results[i] = repo.UpdateResult{Name: c.Name, URL: c.URL, Err: err}
+			continue
 		}
 		r.CachePath = m.RepositoryCache
+
 		wg.Add(1)
-		go func(r *repo.ChartRepository) {
-			if _, err := r.DownloadIndexFile(); err != nil {
+		go func(i int, r *repo.ChartRepository) {
+			defer wg.Done()
+			_, err := r.DownloadIndexFile()
+			if err != nil {
 				// For those dependencies that are not known to helm and using a
 				// generated key name we display the repo url.
 				if strings.HasPrefix(r.Config.Name, managerKeyPrefix) {
-					fmt.Fprintf(m.Out, "...Unable to get an update from the %q chart repository:\n\t%s\n", r.Config.URL, err)
+					m.logf("...Unable to get an update from the %q chart repository:\n\t%s\n", r.Config.URL, err)
 				} else {
-					fmt.Fprintf(m.Out, "...Unable to get an update from the %q chart repository (%s):\n\t%s\n", r.Config.Name, r.Config.URL, err)
+					m.logf("...Unable to get an update from the %q chart repository (%s):\n\t%s\n", r.Config.Name, r.Config.URL, err)
 				}
 			} else {
 				// For those dependencies that are not known to helm and using a
 				// generated key name we display the repo url.
 				if strings.HasPrefix(r.Config.Name, managerKeyPrefix) {
-					fmt.Fprintf(m.Out, "...Successfully got an update from the %q chart repository\n", r.Config.URL)
+					m.logf("...Successfully got an update from the %q chart repository\n", r.Config.URL)
 				} else {
-					fmt.Fprintf(m.Out, "...Successfully got an update from the %q chart repository\n", r.Config.Name)
+					m.logf("...Successfully got an update from the %q chart repository\n", r.Config.Name)
 				}
 			}
-			wg.Done()
-		}(r)
+			results[i] = repo.UpdateResult{Name: r.Config.Name, URL: r.Config.URL, Err: err}
+		}(i, r)
 	}
 	wg.Wait()
 
-	return nil
+	return results
 }
 
 // findChartURL searches the cache of repo data for a chart that has the name and the repoURL specified.

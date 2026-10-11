@@ -27,6 +27,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"helm.sh/helm/v4/pkg/cmd/require"
+	"helm.sh/helm/v4/pkg/downloader"
 	"helm.sh/helm/v4/pkg/getter"
 	"helm.sh/helm/v4/pkg/repo/v1"
 )
@@ -115,40 +116,35 @@ func (o *repoUpdateOptions) run(out io.Writer) error {
 
 func updateCharts(repos []*repo.ChartRepository, out io.Writer) error {
 	fmt.Fprintln(out, "Hang tight while we grab the latest from your chart repositories...")
-	var wg sync.WaitGroup
-	failRepoURLChan := make(chan string, len(repos))
+	results := make([]repo.UpdateResult, len(repos))
 
+	var wg sync.WaitGroup
 	writeMutex := sync.Mutex{}
-	for _, re := range repos {
+	for i, re := range repos {
 		wg.Add(1)
-		go func(re *repo.ChartRepository) {
+		go func(i int, re *repo.ChartRepository) {
 			defer wg.Done()
-			if _, err := re.DownloadIndexFile(); err != nil {
-				writeMutex.Lock()
-				defer writeMutex.Unlock()
+			_, err := re.DownloadIndexFile()
+
+			writeMutex.Lock()
+			defer writeMutex.Unlock()
+			if err != nil {
 				fmt.Fprintf(out, "...Unable to get an update from the %q chart repository (%s):\n\t%s\n", re.Config.Name, re.Config.URL, err)
-				failRepoURLChan <- re.Config.URL
 			} else {
-				writeMutex.Lock()
-				defer writeMutex.Unlock()
 				fmt.Fprintf(out, "...Successfully got an update from the %q chart repository\n", re.Config.Name)
 			}
-		}(re)
+			results[i] = repo.UpdateResult{Name: re.Config.Name, URL: re.Config.URL, Err: err}
+		}(i, re)
 	}
+	wg.Wait()
 
-	go func() {
-		wg.Wait()
-		close(failRepoURLChan)
-	}()
-
-	var repoFailList []string
-	for url := range failRepoURLChan {
-		repoFailList = append(repoFailList, url)
-	}
-
-	if len(repoFailList) > 0 {
-		return fmt.Errorf("failed to update the following repositories: %s",
-			repoFailList)
+	// Return a structured error with one entry per failed repository so
+	// callers can distinguish a total failure from a partial one.
+	if updateErr := downloader.NewRepositoryUpdateError(results); updateErr != nil {
+		if failed, ok := errors.AsType[*downloader.ErrRepositoryUpdates](updateErr); ok && failed.AllFailed() {
+			fmt.Fprintln(out, "Update Failed. All chart repositories failed to update.")
+		}
+		return updateErr
 	}
 
 	fmt.Fprintln(out, "Update Complete. ⎈Happy Helming!⎈")

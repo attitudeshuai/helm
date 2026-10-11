@@ -37,6 +37,20 @@ type HTTPGetter struct {
 	once      sync.Once
 }
 
+// HTTPStatusError is returned when an HTTP(S) request completes but the
+// response carries a non-success status code. Callers can inspect the status
+// code to decide whether the request is retryable.
+type HTTPStatusError struct {
+	URL        string
+	StatusCode int
+	Status     string
+}
+
+// Error implements the error interface.
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("failed to fetch %s : %s", e.URL, e.Status)
+}
+
 // Get performs a Get from repo.Getter and returns the body.
 func (g *HTTPGetter) Get(href string, options ...Option) (*bytes.Buffer, error) {
 	// Create a local copy of options to avoid data races when Get is called concurrently
@@ -97,7 +111,7 @@ func (g *HTTPGetter) get(href string, opts getterOptions) (*bytes.Buffer, error)
 	defer resp.Body.Close()
 	slog.Debug("fetch complete", "url", href, "status", resp.Status, "content-length", resp.ContentLength)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch %s : %s", href, resp.Status)
+		return nil, &HTTPStatusError{URL: href, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	buf := bytes.NewBuffer(nil)

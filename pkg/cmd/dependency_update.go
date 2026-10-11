@@ -18,7 +18,10 @@ package cmd
 import (
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -53,7 +56,10 @@ func newDependencyUpdateCmd(_ *action.Configuration, out io.Writer) *cobra.Comma
 		Short:   "update charts/ based on the contents of Chart.yaml",
 		Long:    dependencyUpDesc,
 		Args:    require.MaximumNArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateDependencyDownloadOptions(client); err != nil {
+				return err
+			}
 			chartpath := "."
 			if len(args) > 0 {
 				chartpath = filepath.Clean(args[0])
@@ -68,6 +74,11 @@ func newDependencyUpdateCmd(_ *action.Configuration, out io.Writer) *cobra.Comma
 				return fmt.Errorf("missing registry client: %w", err)
 			}
 
+			// Cancel in-flight dependency processing on the first interrupt or
+			// termination signal.
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
 			man := &downloader.Manager{
 				Out:              out,
 				ChartPath:        chartpath,
@@ -80,6 +91,10 @@ func newDependencyUpdateCmd(_ *action.Configuration, out io.Writer) *cobra.Comma
 				ContentCache:     settings.ContentCache,
 				Debug:            settings.Debug,
 				SourceDateEpoch:  sourceDateEpoch,
+				Concurrency:      client.Concurrency,
+				MaxRetries:       client.MaxRetries,
+				RetryInterval:    client.RetryInterval,
+				Context:          ctx,
 			}
 			if client.Verify {
 				man.Verify = downloader.VerifyAlways

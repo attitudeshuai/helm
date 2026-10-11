@@ -16,6 +16,7 @@ limitations under the License.
 package cmd
 
 import (
+	"fmt"
 	"io"
 	"path/filepath"
 
@@ -24,6 +25,7 @@ import (
 
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/cmd/require"
+	"helm.sh/helm/v4/pkg/downloader"
 )
 
 const dependencyDesc = `
@@ -133,4 +135,23 @@ func addDependencySubcommandFlags(f *pflag.FlagSet, client *action.Dependency) {
 	f.BoolVar(&client.InsecureSkipTLSVerify, "insecure-skip-tls-verify", false, "skip tls certificate checks for the chart download")
 	f.BoolVar(&client.PlainHTTP, "plain-http", false, "use insecure HTTP connections for the chart download")
 	f.StringVar(&client.CaFile, "ca-file", "", "verify certificates of HTTPS-enabled servers using this CA bundle")
+	f.IntVar(&client.Concurrency, "concurrency", downloader.DefaultDownloadConcurrency, "maximum number of chart dependencies to download in parallel")
+	f.IntVar(&client.MaxRetries, "retries", downloader.DefaultDownloadRetries, "number of times to retry a transient chart download failure")
+	f.DurationVar(&client.RetryInterval, "retry-interval", downloader.DefaultRetryInterval, "time to wait between download attempts")
+}
+
+// validateDependencyDownloadOptions validates the download scheduling flags
+// shared by 'helm dependency update' and 'helm dependency build'. Invalid
+// values are rejected before any work begins.
+func validateDependencyDownloadOptions(client *action.Dependency) error {
+	if client.Concurrency < 1 {
+		return fmt.Errorf("--concurrency must be at least 1, got %d", client.Concurrency)
+	}
+	if client.MaxRetries < 0 {
+		return fmt.Errorf("--retries must be zero or greater, got %d", client.MaxRetries)
+	}
+	if client.RetryInterval < 0 {
+		return fmt.Errorf("--retry-interval must be zero or greater, got %s", client.RetryInterval)
+	}
+	return nil
 }

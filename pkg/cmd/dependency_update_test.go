@@ -160,7 +160,9 @@ func TestDependencyUpdateCmd_DoNotDeleteOldChartsOnError(t *testing.T) {
 	srv.Stop()
 	contentCache := t.TempDir()
 
-	_, output, err = executeActionCommand(fmt.Sprintf("dependency update %s --repository-config %s --repository-cache %s --content-cache %s --plain-http", dir(chartname), dir("repositories.yaml"), dir(), contentCache))
+	// Retries are disabled so the connection failure does not delay the test
+	// with the default retry backoff.
+	_, output, err = executeActionCommand(fmt.Sprintf("dependency update %s --repository-config %s --repository-cache %s --content-cache %s --plain-http --retries 0", dir(chartname), dir("repositories.yaml"), dir(), contentCache))
 	if err == nil {
 		t.Logf("Output: %s", output)
 		t.Fatal("Expected error, got nil")
@@ -217,6 +219,33 @@ func TestDependencyUpdateCmd_WithRepoThatWasNotAdded(t *testing.T) {
 	// This is written directly to stdout, so we have to capture as is
 	assert.Contains(t, out, `Getting updates for unmanaged Helm repositories...`, "No ‘unmanaged’ Helm repo used in test chartdependency or it doesn’t cause the creation "+
 		"of an ‘ad hoc’ repo index cache file\n%s", out)
+}
+
+func TestDependencyUpdateCmd_InvalidDownloadFlags(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags string
+		want  string
+	}{
+		{name: "zero concurrency", flags: "--concurrency 0", want: "--concurrency must be at least 1"},
+		{name: "negative concurrency", flags: "--concurrency -1", want: "--concurrency must be at least 1"},
+		{name: "negative retries", flags: "--retries -1", want: "--retries must be zero or greater"},
+		{name: "negative retry interval", flags: "--retry-interval -1s", want: "--retry-interval must be zero or greater"},
+		{name: "non integer concurrency", flags: "--concurrency many", want: "invalid argument"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := executeActionCommand("dependency update " + tt.flags)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func TestDependencyBuildCmd_InvalidDownloadFlags(t *testing.T) {
+	_, _, err := executeActionCommand("dependency build --retries -1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--retries must be zero or greater")
 }
 
 func setupMockRepoServer(t *testing.T) *repotest.Server {

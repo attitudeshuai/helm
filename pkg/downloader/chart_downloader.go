@@ -17,6 +17,7 @@ package downloader
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -24,6 +25,8 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -599,4 +602,50 @@ func stripDigestAlgorithm(digest string) string {
 		return after
 	}
 	return digest
+}
+
+// isRetryableDownloadError reports whether an error returned while downloading
+// a chart is likely transient and the download can safely be retried.
+//
+// Only transport-level failures (timeouts, resets, refused connections, EOF
+// during transfer) and HTTP 429/5xx responses qualify. Deterministic failures
+// (unknown schemes, missing charts or repositories, malformed references,
+// digest and provenance verification failures, any other HTTP status) are not
+// retried, keeping the existing cache, content digest and provenance rules
+// unchanged.
+func isRetryableDownloadError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	if statusErr, ok := errors.AsType[*getter.HTTPStatusError](err); ok {
+		return statusErr.StatusCode == http.StatusTooManyRequests || statusErr.StatusCode >= http.StatusInternalServerError
+	}
+
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(urlErr, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	msg := strings.ToLower(urlErr.Err.Error())
+	for _, fragment := range []string{
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"server closed idle connection",
+		"network is unreachable",
+		"i/o timeout",
+		"unexpected eof",
+		" eof",
+	} {
+		if strings.Contains(msg, fragment) {
+			return true
+		}
+	}
+	return false
 }

@@ -321,6 +321,9 @@ func runInstall(args []string, client *action.Install, valueOpts *values.Options
 				Debug:            settings.Debug,
 				RegistryClient:   client.GetRegistryClient(),
 				SourceDateEpoch:  sourceDateEpoch,
+				Concurrency:      downloader.DefaultDownloadConcurrency,
+				MaxRetries:       downloader.DefaultDownloadRetries,
+				RetryInterval:    downloader.DefaultRetryInterval,
 			}
 			if err := man.Update(); err != nil {
 				return nil, err

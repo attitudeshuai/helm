@@ -17,9 +17,17 @@ package downloader
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io/fs"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +39,7 @@ import (
 	"helm.sh/helm/v4/pkg/chart/v2/loader"
 	chartutil "helm.sh/helm/v4/pkg/chart/v2/util"
 	"helm.sh/helm/v4/pkg/getter"
+	"helm.sh/helm/v4/pkg/helmpath"
 	"helm.sh/helm/v4/pkg/repo/v1"
 	"helm.sh/helm/v4/pkg/repo/v1/repotest"
 )
@@ -654,4 +663,520 @@ func TestWriteLock(t *testing.T) {
 		require.NoError(t, os.WriteFile(filePath, []byte("file"), 0o644))
 		assert.Error(t, writeLock(filePath, lock, false))
 	})
+}
+
+// httpGetters returns getter providers handling plain http(s) only.
+func httpGetters() getter.Providers {
+	return getter.Providers{getter.Provider{
+		Schemes: []string{"http", "https"},
+		New:     getter.NewHTTPGetter,
+	}}
+}
+
+// noTmpChartsLeft fails if a downloadAll invocation left a temp directory in
+// the chart path.
+func assertNoTmpCharts(t *testing.T, chartPath string) {
+	t.Helper()
+	left, err := filepath.Glob(filepath.Join(chartPath, "tmpcharts-*"))
+	require.NoError(t, err)
+	assert.Empty(t, left, "temporary chart directories were not cleaned up")
+}
+
+// TestDownloadAll_PartialFailureContinuesAndMovesSuccesses ensures a failing
+// dependency does not interrupt the others, that successful downloads are
+// still moved into charts/ and that the aggregate error names the failed
+// dependency with its requested version and repository.
+func TestDownloadAll_PartialFailureContinuesAndMovesSuccesses(t *testing.T) {
+	srv := repotest.NewTempServer(t, repotest.WithChartSourceGlob("testdata/*.tgz*"))
+	defer srv.Stop()
+	require.NoError(t, srv.LinkIndices())
+
+	dir := func(p ...string) string {
+		return filepath.Join(append([]string{srv.Root()}, p...)...)
+	}
+
+	chartPath := t.TempDir()
+	var out bytes.Buffer
+	m := &Manager{
+		Out:              &out,
+		ChartPath:        chartPath,
+		Getters:          httpGetters(),
+		RepositoryConfig: dir("repositories.yaml"),
+		RepositoryCache:  dir(),
+		ContentCache:     t.TempDir(),
+		MaxRetries:       0,
+	}
+
+	deps := []*chart.Dependency{
+		{Name: "local-subchart", Version: "0.1.0", Repository: srv.URL()},
+		{Name: "does-not-exist", Version: "9.9.9", Repository: srv.URL()},
+	}
+
+	err := m.downloadAll(deps)
+	require.Error(t, err)
+
+	var dlErr *ErrDependencyDownloads
+	require.ErrorAs(t, err, &dlErr)
+
+	failed := dlErr.Failed()
+	require.Len(t, failed, 1, "exactly one dependency should be reported as failed")
+	assert.Equal(t, "does-not-exist", failed[0].Name)
+	assert.Equal(t, "9.9.9", failed[0].Version)
+	assert.Equal(t, srv.URL(), failed[0].Repository)
+	assert.Equal(t, DependencyFailed, failed[0].Status)
+	require.ErrorContains(t, err, "does-not-exist")
+	require.ErrorContains(t, err, "9.9.9")
+	require.ErrorContains(t, err, srv.URL())
+
+	// The successful download is moved even though another dependency failed.
+	_, err = os.Stat(filepath.Join(chartPath, "charts", "local-subchart-0.1.0.tgz"))
+	require.NoError(t, err, "successfully downloaded chart should have been moved to charts/")
+
+	// Nothing is left in the temp directory.
+	assertNoTmpCharts(t, chartPath)
+}
+
+// TestDownloadAll_PartialFailurePreservesOldArtifacts verifies that on partial
+// failure outdated versions of successfully updated dependencies are removed,
+// while the previous artifact of a failed dependency is kept for the next run.
+func TestDownloadAll_PartialFailurePreservesOldArtifacts(t *testing.T) {
+	srv := repotest.NewTempServer(t, repotest.WithChartSourceGlob("testdata/*.tgz*"))
+	defer srv.Stop()
+	require.NoError(t, srv.LinkIndices())
+
+	dir := func(p ...string) string {
+		return filepath.Join(append([]string{srv.Root()}, p...)...)
+	}
+
+	chartPath := t.TempDir()
+	chartsDir := filepath.Join(chartPath, "charts")
+	require.NoError(t, os.MkdirAll(chartsDir, 0o755))
+
+	// Old version of the dependency that will update successfully.
+	oldData, err := os.ReadFile(filepath.Join("testdata", "local-subchart-0.1.0.tgz"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(chartsDir, "local-subchart-0.0.9.tgz"), oldData, 0o644))
+
+	// Existing artifact of the dependency that will fail. It must be
+	// preserved so the next run can reuse it.
+	missingChart := &chart.Chart{Metadata: &chart.Metadata{Name: "does-not-exist", Version: "9.9.8", APIVersion: chart.APIVersionV2}}
+	_, err = chartutil.Save(missingChart, chartsDir)
+	require.NoError(t, err)
+
+	var out bytes.Buffer
+	m := &Manager{
+		Out:              &out,
+		ChartPath:        chartPath,
+		Getters:          httpGetters(),
+		RepositoryConfig: dir("repositories.yaml"),
+		RepositoryCache:  dir(),
+		ContentCache:     t.TempDir(),
+		MaxRetries:       0,
+	}
+
+	deps := []*chart.Dependency{
+		{Name: "local-subchart", Version: "0.1.0", Repository: srv.URL()},
+		{Name: "does-not-exist", Version: "9.9.9", Repository: srv.URL()},
+	}
+	require.Error(t, m.downloadAll(deps))
+
+	// New version of the successful dependency moved in.
+	_, err = os.Stat(filepath.Join(chartsDir, "local-subchart-0.1.0.tgz"))
+	require.NoError(t, err)
+	// Old version of a successful dependency is removed as outdated.
+	_, err = os.Stat(filepath.Join(chartsDir, "local-subchart-0.0.9.tgz"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	// Artifact of the failed dependency is preserved.
+	_, err = os.Stat(filepath.Join(chartsDir, "does-not-exist-9.9.8.tgz"))
+	require.NoError(t, err)
+}
+
+// TestDownloadAll_DuplicateSourceDownloadedOnce ensures dependencies resolving
+// to the same source URL are fetched once and followers are skipped.
+func TestDownloadAll_DuplicateSourceDownloadedOnce(t *testing.T) {
+	srv := repotest.NewTempServer(t, repotest.WithChartSourceGlob("testdata/*.tgz*"))
+	defer srv.Stop()
+	require.NoError(t, srv.LinkIndices())
+
+	dir := func(p ...string) string {
+		return filepath.Join(append([]string{srv.Root()}, p...)...)
+	}
+
+	chartPath := t.TempDir()
+	var out bytes.Buffer
+	m := &Manager{
+		Out:              &out,
+		ChartPath:        chartPath,
+		Getters:          httpGetters(),
+		RepositoryConfig: dir("repositories.yaml"),
+		RepositoryCache:  dir(),
+		ContentCache:     t.TempDir(),
+		Concurrency:      4,
+		MaxRetries:       0,
+	}
+
+	deps := []*chart.Dependency{
+		{Name: "local-subchart", Version: "0.1.0", Repository: srv.URL()},
+		{Name: "local-subchart", Version: "0.1.0", Repository: srv.URL()},
+	}
+
+	require.NoError(t, m.downloadAll(deps))
+
+	output := out.String()
+	assert.Equal(t, 1, strings.Count(output, "Downloading local-subchart"),
+		"the shared source should have been downloaded once, output: %s", output)
+	assert.Contains(t, output, "Already downloaded local-subchart")
+
+	_, err := os.Stat(filepath.Join(chartPath, "charts", "local-subchart-0.1.0.tgz"))
+	require.NoError(t, err)
+	assertNoTmpCharts(t, chartPath)
+}
+
+// flakyRepoServer builds an http server, repository config and cached index
+// for a single chart (local-subchart 0.1.0). tgzHandler wraps how the chart
+// archive itself is served.
+func flakyRepoServer(t *testing.T, tgzHandler http.HandlerFunc) (srvURL, cacheDir string, m *Manager, chartPath string) {
+	t.Helper()
+
+	docroot := t.TempDir()
+	tgzData, err := os.ReadFile(filepath.Join("testdata", "local-subchart-0.1.0.tgz"))
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(docroot, "local-subchart-0.1.0.tgz"), tgzData, 0o644))
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".tgz") {
+			tgzHandler(w, r)
+			return
+		}
+		http.FileServer(http.Dir(docroot)).ServeHTTP(w, r)
+	})
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	index, err := repo.IndexDirectory(docroot, ts.URL)
+	require.NoError(t, err)
+
+	cacheDir = t.TempDir()
+	indexBytes, err := yaml.Marshal(index)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, helmpath.CacheIndexFile("test")), indexBytes, 0o644))
+
+	configPath := filepath.Join(cacheDir, "repositories.yaml")
+	rf := repo.NewFile()
+	rf.Add(&repo.Entry{Name: "test", URL: ts.URL})
+	require.NoError(t, rf.WriteFile(configPath, 0o644))
+
+	chartPath = t.TempDir()
+	var out bytes.Buffer
+	m = &Manager{
+		Out:              &out,
+		ChartPath:        chartPath,
+		Getters:          httpGetters(),
+		RepositoryConfig: configPath,
+		RepositoryCache:  cacheDir,
+		ContentCache:     t.TempDir(),
+		Concurrency:      1,
+	}
+	return ts.URL, cacheDir, m, chartPath
+}
+
+// TestDownloadAll_RetriesTransientFailures verifies that transient HTTP 5xx
+// failures are retried and a later success completes the download.
+func TestDownloadAll_RetriesTransientFailures(t *testing.T) {
+	var mu sync.Mutex
+	failures := 2
+	tsURL, _, m, chartPath := flakyRepoServer(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		fail := failures > 0
+		failures--
+		mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join("testdata", "local-subchart-0.1.0.tgz"))
+	})
+	m.MaxRetries = 3
+	m.RetryInterval = time.Millisecond
+
+	deps := []*chart.Dependency{{Name: "local-subchart", Version: "0.1.0", Repository: tsURL}}
+	require.NoError(t, m.downloadAll(deps))
+
+	out := m.Out.(*bytes.Buffer).String()
+	assert.Contains(t, out, "Retrying", "expected a retry notice, got: %s", out)
+
+	_, err := os.Stat(filepath.Join(chartPath, "charts", "local-subchart-0.1.0.tgz"))
+	require.NoError(t, err)
+	assertNoTmpCharts(t, chartPath)
+}
+
+// TestDownloadAll_DoesNotRetryDeterministicFailures verifies that HTTP 404
+// is not retried.
+func TestDownloadAll_DoesNotRetryDeterministicFailures(t *testing.T) {
+	var mu sync.Mutex
+	requests := 0
+	tsURL, _, m, chartPath := flakyRepoServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requests++
+		mu.Unlock()
+		w.WriteHeader(http.StatusNotFound)
+	})
+	m.MaxRetries = 2
+	m.RetryInterval = time.Millisecond
+
+	deps := []*chart.Dependency{{Name: "local-subchart", Version: "0.1.0", Repository: tsURL}}
+	err := m.downloadAll(deps)
+	require.Error(t, err)
+	assert.Equal(t, 1, requests, "a 404 must not be retried")
+	assert.NotContains(t, m.Out.(*bytes.Buffer).String(), "Retrying")
+
+	_, err = os.Stat(filepath.Join(chartPath, "charts", "local-subchart-0.1.0.tgz"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	assertNoTmpCharts(t, chartPath)
+}
+
+// TestDownloadAll_CancelStopsNewDownloads verifies that after cancellation no
+// new dependency is started, not-started dependencies are reported, no partial
+// result is moved and the temp directory is removed.
+func TestDownloadAll_CancelStopsNewDownloads(t *testing.T) {
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	tsURL, _, m, chartPath := flakyRepoServer(t, func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		http.ServeFile(w, r, filepath.Join("testdata", "local-subchart-0.1.0.tgz"))
+	})
+	m.Concurrency = 1
+	m.MaxRetries = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Context = ctx
+
+	done := make(chan error, 1)
+	deps := []*chart.Dependency{
+		{Name: "local-subchart", Version: "0.1.0", Repository: tsURL},
+		{Name: "second-chart", Version: "0.1.0", Repository: tsURL},
+	}
+	go func() { done <- m.downloadAll(deps) }()
+
+	<-arrived
+	// The first download is in flight; cancel before the second is scheduled.
+	cancel()
+	close(release)
+
+	err := <-done
+	require.Error(t, err)
+
+	var dlErr *ErrDependencyDownloads
+	require.ErrorAs(t, err, &dlErr)
+	failed := dlErr.Failed()
+	require.Len(t, failed, 1, "only the dependency not yet started should be reported")
+	assert.Equal(t, "second-chart", failed[0].Name)
+	assert.Equal(t, DependencyNotStarted, failed[0].Status)
+	require.ErrorIs(t, failed[0].Err, context.Canceled)
+
+	// On cancellation nothing is published into charts/.
+	_, err = os.Stat(filepath.Join(chartPath, "charts", "local-subchart-0.1.0.tgz"))
+	require.ErrorIs(t, err, fs.ErrNotExist)
+	assertNoTmpCharts(t, chartPath)
+}
+
+// TestDownloadAll_CanceledBeforeScheduling verifies that with an already
+// cancelled context no dependency is processed and all of them are reported
+// as not started.
+func TestDownloadAll_CanceledBeforeScheduling(t *testing.T) {
+	arrived := make(chan struct{}, 8)
+	tsURL, _, m, chartPath := flakyRepoServer(t, func(_ http.ResponseWriter, _ *http.Request) {
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+	})
+	m.Concurrency = 4
+	m.MaxRetries = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.Context = ctx
+
+	deps := []*chart.Dependency{
+		{Name: "one", Version: "0.1.0", Repository: tsURL},
+		{Name: "two", Version: "0.1.0", Repository: tsURL},
+		{Name: "three", Version: "0.1.0", Repository: tsURL},
+	}
+	err := m.downloadAll(deps)
+	require.Error(t, err)
+
+	var dlErr *ErrDependencyDownloads
+	require.ErrorAs(t, err, &dlErr)
+	failed := dlErr.Failed()
+	require.Len(t, failed, len(deps))
+	for _, r := range failed {
+		assert.Equal(t, DependencyNotStarted, r.Status, "dependency %s should not have started", r.Name)
+		assert.ErrorIs(t, r.Err, context.Canceled)
+	}
+
+	select {
+	case <-arrived:
+		t.Fatal("no download request should have been started")
+	default:
+	}
+
+	entries, err := os.ReadDir(filepath.Join(chartPath, "charts"))
+	require.NoError(t, err)
+	assert.Empty(t, entries, "nothing should have been moved into charts/")
+	assertNoTmpCharts(t, chartPath)
+}
+
+// TestParallelRepoUpdate_StructuredResults checks per-repository results and
+// the all-failed/partial-failed distinction.
+func TestParallelRepoUpdate_StructuredResults(t *testing.T) {
+	srv := repotest.NewTempServer(t, repotest.WithChartSourceGlob("testdata/*.tgz*"))
+	defer srv.Stop()
+	require.NoError(t, srv.LinkIndices())
+
+	dir := func(p ...string) string {
+		return filepath.Join(append([]string{srv.Root()}, p...)...)
+	}
+
+	// A server that is closed gives an immediate connection failure.
+	bad := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	bad.Close()
+
+	t.Run("partial failure", func(t *testing.T) {
+		var out bytes.Buffer
+		m := &Manager{
+			Out:              &out,
+			Getters:          httpGetters(),
+			RepositoryConfig: dir("repositories.yaml"),
+			RepositoryCache:  dir(),
+		}
+		entries := []*repo.Entry{
+			{Name: "test", URL: srv.URL()},
+			{Name: "broken", URL: bad.URL},
+		}
+		results := m.parallelRepoUpdate(context.Background(), entries)
+		require.Len(t, results, 2)
+
+		byName := map[string]repo.UpdateResult{}
+		for _, r := range results {
+			byName[r.Name] = r
+		}
+		require.Contains(t, byName, "test")
+		require.Contains(t, byName, "broken")
+		require.NoError(t, byName["test"].Err)
+		require.Error(t, byName["broken"].Err)
+
+		uerr := &ErrRepositoryUpdates{}
+		require.ErrorAs(t, NewRepositoryUpdateError(results), &uerr)
+		assert.False(t, uerr.AllFailed())
+		failed := uerr.Failed()
+		require.Len(t, failed, 1)
+		assert.Equal(t, "broken", failed[0].Name)
+		assert.Contains(t, uerr.Error(), "broken")
+		assert.Contains(t, uerr.Error(), bad.URL)
+	})
+
+	t.Run("all failed", func(t *testing.T) {
+		var out bytes.Buffer
+		m := &Manager{
+			Out:              &out,
+			Getters:          httpGetters(),
+			RepositoryConfig: dir("repositories.yaml"),
+			RepositoryCache:  dir(),
+		}
+		other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		other.Close()
+		entries := []*repo.Entry{
+			{Name: "broken-1", URL: bad.URL},
+			{Name: "broken-2", URL: other.URL},
+		}
+		results := m.parallelRepoUpdate(context.Background(), entries)
+		uerr := &ErrRepositoryUpdates{}
+		require.ErrorAs(t, NewRepositoryUpdateError(results), &uerr)
+		assert.True(t, uerr.AllFailed())
+		assert.Len(t, uerr.Failed(), 2)
+	})
+
+	t.Run("all succeeded", func(t *testing.T) {
+		var out bytes.Buffer
+		m := &Manager{
+			Out:              &out,
+			Getters:          httpGetters(),
+			RepositoryConfig: dir("repositories.yaml"),
+			RepositoryCache:  dir(),
+		}
+		results := m.parallelRepoUpdate(context.Background(), []*repo.Entry{
+			{Name: "test", URL: srv.URL()},
+		})
+		require.NoError(t, NewRepositoryUpdateError(results))
+	})
+}
+
+func TestIsRetryableDownloadError(t *testing.T) {
+	timeoutURL, err := url.Parse("http://example.com/charts")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "http 404", err: &getter.HTTPStatusError{StatusCode: http.StatusNotFound}, want: false},
+		{name: "http 401", err: &getter.HTTPStatusError{StatusCode: http.StatusUnauthorized}, want: false},
+		{name: "http 429", err: &getter.HTTPStatusError{StatusCode: http.StatusTooManyRequests}, want: true},
+		{name: "http 500", err: &getter.HTTPStatusError{StatusCode: http.StatusInternalServerError}, want: true},
+		{name: "http 503", err: &getter.HTTPStatusError{StatusCode: http.StatusServiceUnavailable}, want: true},
+		{name: "connection refused", err: &url.Error{URL: timeoutURL.String(), Op: "Get", Err: &net.OpError{Op: "dial", Err: errors.New("connection refused")}}, want: true},
+		{name: "connection reset", err: &url.Error{URL: timeoutURL.String(), Op: "Get", Err: errors.New("read tcp: connection reset by peer")}, want: true},
+		{name: "plain deterministic error", err: errors.New("chart not found"), want: false},
+		{name: "cancellation", err: context.Canceled, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isRetryableDownloadError(tt.err))
+		})
+	}
+}
+
+func TestNewDependencyDownloadsError(t *testing.T) {
+	results := []DependencyResult{
+		{Name: "a", Version: "1.0.0", Repository: "https://example.com", Status: DependencySucceeded},
+		{Name: "b", Version: "2.0.0", Repository: "https://example.com", Status: DependencySkipped},
+	}
+	require.NoError(t, newDependencyDownloadsError(results))
+
+	results = append(results, DependencyResult{
+		Name: "c", Version: "3.0.0", Repository: "https://example.com",
+		Status: DependencyFailed, Err: errors.New("boom"),
+	}, DependencyResult{
+		Name: "d", Version: "4.0.0", Repository: "",
+		Status: DependencyNotStarted, Err: context.Canceled,
+	})
+	err := newDependencyDownloadsError(results)
+	require.Error(t, err)
+	var dlErr *ErrDependencyDownloads
+	require.ErrorAs(t, err, &dlErr)
+	failed := dlErr.Failed()
+	require.Len(t, failed, 2)
+	msg := err.Error()
+	assert.Contains(t, msg, `"c" version "3.0.0" from https://example.com: boom`)
+	assert.Contains(t, msg, "(charts directory)")
+}
+
+func TestDedupeReposOrder(t *testing.T) {
+	repos := []*repo.Entry{
+		{Name: "a", URL: "https://example.com/a"},
+		{Name: "b", URL: "https://example.com/b"},
+		{Name: "c", URL: "https://example.com/a/"}, // duplicate of a with trailing slash, last one wins
+	}
+	got := dedupeRepos(repos)
+	require.Len(t, got, 2)
+	assert.Equal(t, "c", got[0].Name, "duplicate keeps the first-seen position and the last entry wins")
+	assert.Equal(t, "b", got[1].Name, "input order is preserved for distinct entries")
 }

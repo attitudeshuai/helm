@@ -227,6 +227,9 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 						Debug:            settings.Debug,
 						SourceDateEpoch:  sourceDateEpoch,
 						RegistryClient:   registryClient,
+						Concurrency:      downloader.DefaultDownloadConcurrency,
+						MaxRetries:       downloader.DefaultDownloadRetries,
+						RetryInterval:    downloader.DefaultRetryInterval,
 					}
 					if err := man.Update(); err != nil {
 						return err

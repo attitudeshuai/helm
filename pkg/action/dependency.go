@@ -22,12 +22,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/gosuri/uitable"
 
 	chart "helm.sh/helm/v4/pkg/chart/v2"
 	"helm.sh/helm/v4/pkg/chart/v2/loader"
+	"helm.sh/helm/v4/pkg/downloader"
 )
 
 // Dependency is the action for building a given chart's dependency tree.
@@ -45,12 +47,21 @@ type Dependency struct {
 	CaFile                string
 	InsecureSkipTLSVerify bool
 	PlainHTTP             bool
+	// Concurrency limits how many dependencies are downloaded in parallel.
+	Concurrency int
+	// MaxRetries is the number of retries for transient download failures.
+	MaxRetries int
+	// RetryInterval is the time to wait between download attempts.
+	RetryInterval time.Duration
 }
 
 // NewDependency creates a new Dependency object with the given configuration.
 func NewDependency() *Dependency {
 	return &Dependency{
-		ColumnWidth: 80,
+		ColumnWidth:   80,
+		Concurrency:   downloader.DefaultDownloadConcurrency,
+		MaxRetries:    downloader.DefaultDownloadRetries,
+		RetryInterval: downloader.DefaultRetryInterval,
 	}
 }
 

@@ -107,6 +107,9 @@ func newPackageCmd(out io.Writer) *cobra.Command {
 						RepositoryCache:  settings.RepositoryCache,
 						ContentCache:     settings.ContentCache,
 						SourceDateEpoch:  sourceDateEpoch,
+						Concurrency:      downloader.DefaultDownloadConcurrency,
+						MaxRetries:       downloader.DefaultDownloadRetries,
+						RetryInterval:    downloader.DefaultRetryInterval,
 					}
 
 					if err := downloadManager.Update(); err != nil {
