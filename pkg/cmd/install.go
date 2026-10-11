@@ -37,6 +37,7 @@ import (
 	"helm.sh/helm/v4/pkg/cli/values"
 	"helm.sh/helm/v4/pkg/cmd/require"
 	"helm.sh/helm/v4/pkg/downloader"
+	"helm.sh/helm/v4/pkg/engine"
 	"helm.sh/helm/v4/pkg/getter"
 	release "helm.sh/helm/v4/pkg/release/v1"
 )
@@ -134,6 +135,7 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	client.WaitOptions = append(client.WaitOptions, defaultCLIWaitOptions()...)
 	valueOpts := &values.Options{}
 	var outfmt output.Format
+	var renderTimeoutRaw string
 
 	cmd := &cobra.Command{
 		Use:   "install [NAME] [CHART]",
@@ -144,6 +146,14 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			return compInstall(args, toComplete, client)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			renderTimeout, parseErr := engine.ParseRenderTimeout(renderTimeoutRaw)
+			if parseErr != nil {
+				return parseErr
+			}
+			if renderTimeout != nil {
+				client.RenderTimeout = *renderTimeout
+			}
+
 			registryClient, err := newRegistryClient(out, client.CertFile, client.KeyFile, client.CaFile,
 				client.InsecureSkipTLSVerify, client.PlainHTTP, client.Username, client.Password)
 			if err != nil {
@@ -174,6 +184,7 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 
 	f := cmd.Flags()
 	addInstallFlags(cmd, f, client, valueOpts)
+	bindRenderTimeoutFlag(f, &renderTimeoutRaw)
 	// hide-secret is not available in all places the install flags are used so
 	// it is added separately
 	f.BoolVar(&client.HideSecret, "hide-secret", false, "hide Kubernetes Secrets when also using the --dry-run flag")
@@ -209,6 +220,7 @@ func addInstallFlags(cmd *cobra.Command, f *pflag.FlagSet, client *action.Instal
 	f.BoolVar(&client.SkipSchemaValidation, "skip-schema-validation", false, "if set, disables JSON schema validation")
 	f.StringToStringVarP(&client.Labels, "labels", "l", nil, "Labels that would be added to release metadata. Should be divided by comma.")
 	f.BoolVar(&client.EnableDNS, "enable-dns", false, "enable DNS lookups when rendering templates")
+	f.BoolVar(&client.RenderPartialResults, "render-partial", false, "keep templates rendered successfully in the output even when other templates fail or the render timeout is reached; the operation is still reported as failed and all failed templates are listed")
 	f.BoolVar(&client.HideNotes, "hide-notes", false, "if set, do not show notes in install output. Does not affect presence in chart metadata")
 	f.BoolVar(&client.TakeOwnership, "take-ownership", false, "if set, install will ignore the check for helm annotations and take ownership of the existing resources")
 
@@ -250,6 +262,14 @@ func addInstallFlags(cmd *cobra.Command, f *pflag.FlagSet, client *action.Instal
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// bindRenderTimeoutFlag registers the --render-timeout flag against the given
+// string holder. The value is parsed and validated (empty disables the
+// timeout; zero, negative and unparseable durations are errors) when the
+// command runs.
+func bindRenderTimeoutFlag(f *pflag.FlagSet, raw *string) {
+	f.StringVar(raw, "render-timeout", "", "time limit for rendering all chart templates, including subchart templates and nested 'tpl' calls (e.g. 30s); when exceeded rendering stops and no further templates are started")
 }
 
 func runInstall(args []string, client *action.Install, valueOpts *values.Options, out io.Writer) (*release.Release, error) {

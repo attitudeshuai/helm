@@ -37,6 +37,7 @@ import (
 	"helm.sh/helm/v4/pkg/cli/values"
 	"helm.sh/helm/v4/pkg/cmd/require"
 	"helm.sh/helm/v4/pkg/downloader"
+	"helm.sh/helm/v4/pkg/engine"
 	"helm.sh/helm/v4/pkg/getter"
 	ri "helm.sh/helm/v4/pkg/release"
 	"helm.sh/helm/v4/pkg/release/common"
@@ -88,6 +89,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	valueOpts := &values.Options{}
 	var outfmt output.Format
 	var createNamespace bool
+	var renderTimeoutRaw string
 
 	cmd := &cobra.Command{
 		Use:   "upgrade [RELEASE] [CHART]",
@@ -104,6 +106,14 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			return noMoreArgsComp()
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			renderTimeout, parseErr := engine.ParseRenderTimeout(renderTimeoutRaw)
+			if parseErr != nil {
+				return parseErr
+			}
+			if renderTimeout != nil {
+				client.RenderTimeout = *renderTimeout
+			}
+
 			client.Namespace = settings.Namespace()
 
 			registryClient, err := newRegistryClient(out, client.CertFile, client.KeyFile, client.CaFile,
@@ -154,6 +164,8 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 					instClient.DependencyUpdate = client.DependencyUpdate
 					instClient.Labels = client.Labels
 					instClient.EnableDNS = client.EnableDNS
+					instClient.RenderTimeout = client.RenderTimeout
+					instClient.RenderPartialResults = client.RenderPartialResults
 					instClient.HideSecret = client.HideSecret
 					instClient.TakeOwnership = client.TakeOwnership
 					instClient.ForceConflicts = client.ForceConflicts
@@ -306,6 +318,8 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	f.StringVar(&client.Description, "description", "", "add a custom description")
 	f.BoolVar(&client.DependencyUpdate, "dependency-update", false, "update dependencies if they are missing before installing the chart")
 	f.BoolVar(&client.EnableDNS, "enable-dns", false, "enable DNS lookups when rendering templates")
+	bindRenderTimeoutFlag(f, &renderTimeoutRaw)
+	f.BoolVar(&client.RenderPartialResults, "render-partial", false, "keep templates rendered successfully in the output even when other templates fail or the render timeout is reached; the operation is still reported as failed and all failed templates are listed")
 	f.BoolVar(&client.TakeOwnership, "take-ownership", false, "if set, upgrade will ignore the check for helm annotations and take ownership of the existing resources")
 	addDryRunFlag(cmd)
 	addChartPathOptionsFlags(f, &client.ChartPathOptions)

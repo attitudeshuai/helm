@@ -37,6 +37,7 @@ import (
 	"helm.sh/helm/v4/pkg/chart/common"
 	"helm.sh/helm/v4/pkg/cli/values"
 	"helm.sh/helm/v4/pkg/cmd/require"
+	"helm.sh/helm/v4/pkg/engine"
 	releaseutil "helm.sh/helm/v4/pkg/release/v1/util"
 )
 
@@ -62,6 +63,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	var validate bool
 	var includeCrds bool
 	var skipTests bool
+	var renderTimeoutRaw string
 	client := action.NewInstall(cfg)
 	valueOpts := &values.Options{}
 	var kubeVersion string
@@ -77,6 +79,14 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			return compInstall(args, toComplete, client)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			renderTimeout, parseErr := engine.ParseRenderTimeout(renderTimeoutRaw)
+			if parseErr != nil {
+				return parseErr
+			}
+			if renderTimeout != nil {
+				client.RenderTimeout = *renderTimeout
+			}
+
 			if kubeVersion != "" {
 				parsedKubeVersion, err := common.ParseKubeVersion(kubeVersion)
 				if err != nil {
@@ -107,7 +117,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			client.IncludeCRDs = includeCrds
 			rel, err := runInstall(args, client, valueOpts, out)
 
-			if err != nil && !settings.Debug {
+			if err != nil && !settings.Debug && !client.RenderPartialResults {
 				if rel != nil {
 					return fmt.Errorf("%w\n\nUse --debug flag to render out invalid YAML", err)
 				}
@@ -208,6 +218,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 
 	f := cmd.Flags()
 	addInstallFlags(cmd, f, client, valueOpts)
+	bindRenderTimeoutFlag(f, &renderTimeoutRaw)
 	f.StringArrayVarP(&showFiles, "show-only", "s", []string{}, "only show manifests rendered from the given templates")
 	f.StringVar(&client.OutputDir, "output-dir", "", "writes the executed templates to files in output-dir instead of stdout")
 	f.BoolVar(&validate, "validate", false, "deprecated")

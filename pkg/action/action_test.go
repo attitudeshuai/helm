@@ -33,6 +33,7 @@ import (
 	"helm.sh/helm/v4/internal/logging"
 	"helm.sh/helm/v4/pkg/chart/common"
 	chart "helm.sh/helm/v4/pkg/chart/v2"
+	"helm.sh/helm/v4/pkg/engine"
 	"helm.sh/helm/v4/pkg/kube"
 	kubefake "helm.sh/helm/v4/pkg/kube/fake"
 	"helm.sh/helm/v4/pkg/registry"
@@ -2291,4 +2292,64 @@ func TestInteractWithServer(t *testing.T) {
 	assert.True(t, interactWithServer(DryRunNone))
 	assert.False(t, interactWithServer(DryRunClient))
 	assert.True(t, interactWithServer(DryRunServer))
+}
+
+func renderPartialChart(t *testing.T) *chart.Chart {
+	t.Helper()
+	modTime := time.Now()
+	return buildChartWithTemplates([]*common.File{
+		{Name: "templates/zz-good.yaml", ModTime: modTime, Data: []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: render-good\n")},
+		{Name: "templates/yy-bad.yaml", ModTime: modTime, Data: []byte(`{{ fail "planned render failure" }}`)},
+	}, withName("partialchart"))
+}
+
+func TestRenderResources_RenderPartialResults(t *testing.T) {
+	cfg := actionConfigFixture(t)
+	cfg.RenderPartialResults = true
+	ch := renderPartialChart(t)
+
+	_, buf, _, err := cfg.renderResources(
+		t.Context(), ch, map[string]any{}, "test-release", "", false, false, false,
+		nil, false, false, false, PostRenderStrategyCombined,
+	)
+	require.Error(t, err)
+	var renderErr *engine.RenderError
+	require.True(t, errors.As(err, &renderErr), "expected *engine.RenderError, got %T: %v", err, err)
+
+	// The usable product is rendered into the output ...
+	assert.Contains(t, buf.String(), "# Source: partialchart/templates/zz-good.yaml")
+	assert.Contains(t, buf.String(), "name: render-good")
+	// ... the failed template is absent from the products ...
+	assert.NotContains(t, buf.String(), "yy-bad.yaml")
+	// ... while the complete failure list is retained so the operation is
+	// still judged as failed overall.
+	require.Len(t, renderErr.Failures, 1)
+	assert.Equal(t, "partialchart/templates/yy-bad.yaml", renderErr.Failures[0].Path)
+	assert.Equal(t, engine.RenderStageExecute, renderErr.Failures[0].Stage)
+	assert.False(t, renderErr.Failures[0].TimedOut)
+}
+
+func TestRenderResources_RenderFailureDiscardsOutputByDefault(t *testing.T) {
+	cfg := actionConfigFixture(t)
+	ch := renderPartialChart(t)
+
+	_, buf, _, err := cfg.renderResources(
+		t.Context(), ch, map[string]any{}, "test-release", "", false, false, false,
+		nil, false, false, false, PostRenderStrategyCombined,
+	)
+	require.Error(t, err)
+	assert.Empty(t, buf.String())
+}
+
+func TestRenderResources_InvalidRenderTimeout(t *testing.T) {
+	cfg := actionConfigFixture(t)
+	cfg.RenderTimeout = -1
+	ch := buildChart()
+
+	_, _, _, err := cfg.renderResources(
+		t.Context(), ch, map[string]any{}, "test-release", "", false, false, false,
+		nil, false, false, false, PostRenderStrategyCombined,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid render timeout")
 }

@@ -136,6 +136,21 @@ type Configuration struct {
 	// CustomTemplateFuncs is defined by users to provide custom template funcs
 	CustomTemplateFuncs template.FuncMap
 
+	// RenderTimeout optionally bounds a single chart template rendering,
+	// including all subchart templates and nested 'tpl'/'include' rendering.
+	// Zero disables the render timeout; a caller-supplied context deadline
+	// is still honored. Negative durations are rejected when rendering runs.
+	RenderTimeout time.Duration
+
+	// RenderPartialResults keeps templates that rendered successfully even
+	// when other templates fail or the render timeout is reached. The
+	// successful products are still rendered into the template/dry-run
+	// output while the complete failure list is reported, but the operation
+	// is still judged as failed overall and nothing is written to release
+	// storage. This never affects the structure stored for a successful
+	// release.
+	RenderPartialResults bool
+
 	// HookOutputFunc called with container name and returns and expects writer that will receive the log output.
 	HookOutputFunc func(namespace, pod, container string) io.Writer
 
@@ -292,31 +307,46 @@ func (cfg *Configuration) renderResources(ctx context.Context, ch *chart.Chart, 
 	}
 
 	var files map[string]string
-	var err2 error
+	var renderErr error
+
+	renderOpts := engine.RenderOptions{PartialResults: cfg.RenderPartialResults}
+	if cfg.RenderTimeout != 0 {
+		// Zero disables the timeout; negative values are forwarded so the
+		// engine rejects them as invalid configuration.
+		timeout := cfg.RenderTimeout
+		renderOpts.Timeout = &timeout
+	}
 
 	// A `helm template` should not talk to the remote cluster. However, commands with the flag
 	// `--dry-run` with the value of `false`, `none`, or `server` should try to interact with the cluster.
 	// It may break in interesting and exotic ways because other data (e.g. discovery) is mocked.
+	var e engine.Engine
 	if interactWithRemote && cfg.RESTClientGetter != nil {
 		restConfig, err := cfg.RESTClientGetter.ToRESTConfig()
 		if err != nil {
 			return hs, b, "", err
 		}
-		e := engine.New(restConfig)
-		e.EnableDNS = enableDNS
-		e.CustomTemplateFuncs = cfg.CustomTemplateFuncs
-
-		files, err2 = e.RenderWithContext(ctx, ch, values)
-	} else {
-		var e engine.Engine
-		e.EnableDNS = enableDNS
-		e.CustomTemplateFuncs = cfg.CustomTemplateFuncs
-
-		files, err2 = e.RenderWithContext(ctx, ch, values)
+		e = engine.New(restConfig)
 	}
+	e.EnableDNS = enableDNS
+	e.CustomTemplateFuncs = cfg.CustomTemplateFuncs
 
+	result, err2 := e.RenderWithOptions(ctx, ch, values, renderOpts)
+	files = result.Files
 	if err2 != nil {
-		return hs, b, "", err2
+		var renderFailures *engine.RenderError
+		if !errors.As(err2, &renderFailures) {
+			// Configuration and validation errors are not per-template failures.
+			return hs, b, "", err2
+		}
+		if !cfg.RenderPartialResults {
+			return hs, b, "", err2
+		}
+		// Partial results are enabled: surface the complete failure list,
+		// keep rendering the usable products, but remember the error so the
+		// operation is still judged as failed overall.
+		cfg.Logger().Warn("template rendering produced partial results", slog.Any("error", err2))
+		renderErr = err2
 	}
 
 	// NOTES.txt gets rendered like all the other files, but because it's not a hook nor a resource,
@@ -519,7 +549,10 @@ func (cfg *Configuration) renderResources(ctx context.Context, ch *chart.Chart, 
 		}
 	}
 
-	return hs, b, notes, nil
+	// When partial results were rendered the manifest buffer holds the
+	// usable products, but the retained render error keeps the operation's
+	// overall success judgment unchanged.
+	return hs, b, notes, renderErr
 }
 
 // RESTClientGetter gets the rest client

@@ -111,6 +111,35 @@ func (e Engine) RenderWithContext(ctx context.Context, chrt ci.Charter, values c
 	return e.render(ctx, tmap)
 }
 
+// RenderWithOptions renders the Go templates of a chart like
+// RenderWithContext, but applies the given render options.
+//
+// When opts declares a Timeout, that deadline bounds the whole render call;
+// a deadline carried by ctx is honored as well, and the earlier of the two
+// applies. Once the deadline is reached, no new template execution is
+// started and the call stops waiting for the template that is executing.
+//
+// Every template that does not finish is reported as a separate entry in
+// RenderResult.Failures with its path, failure stage (parse or execute) and
+// reason; deadline-driven failures are marked as timeouts. When
+// opts.PartialResults is enabled, successfully rendered templates are kept in
+// RenderResult.Files; otherwise any failure returns an error with empty
+// files, preserving the historical overall-failure behavior.
+//
+// With the zero RenderOptions the result, error text and performance are
+// identical to RenderWithContext.
+func (e Engine) RenderWithOptions(ctx context.Context, chrt ci.Charter, values common.Values, opts RenderOptions) (RenderResult, error) {
+	if err := opts.Validate(); err != nil {
+		return RenderResult{Files: map[string]string{}}, err
+	}
+	tmap := allTemplates(chrt, values)
+	if opts.Timeout == nil && !opts.PartialResults {
+		files, err := e.render(ctx, tmap)
+		return RenderResult{Files: files}, err
+	}
+	return e.renderWithOptions(ctx, tmap, opts)
+}
+
 // Render takes a chart, optional values, and value overrides, and attempts to
 // render the Go templates using the default options.
 //
@@ -355,6 +384,194 @@ func (e Engine) render(ctx context.Context, tpls map[string]renderable) (rendere
 	}
 
 	return rendered, nil
+}
+
+// renderWithOptions is the deadline-aware counterpart of render.
+//
+// The template walk is still sequential (templates of the chart and its
+// subcharts share one parsed template set), but each template evolves
+// independently: successfully rendered templates are collected as products
+// while parse failures, execution failures and deadline casualties are all
+// recorded separately, so that a single render call reports every failure
+// instead of only the first one.
+func (e Engine) renderWithOptions(ctx context.Context, tpls map[string]renderable, opts RenderOptions) (result RenderResult, err error) {
+	result.Files = map[string]string{}
+
+	if opts.Timeout != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *opts.Timeout)
+		defer cancel()
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("rendering template failed: %v", r)
+		}
+	}()
+
+	t := template.New("gotpl")
+	if e.Strict {
+		t.Option("missingkey=error")
+	} else {
+		t.Option("missingkey=zero")
+	}
+
+	// The context handed to template functions (in particular the cluster
+	// backed 'lookup' function and nested rendering through 'tpl') carries
+	// the render deadline, so cluster calls observe cancellation.
+	e.initFunMap(ctx, t)
+
+	// We want to parse the templates in a predictable order. The order favors
+	// higher-level (in file system) templates over deeply nested templates.
+	keys := sortTemplates(tpls)
+
+	// Parse phase. Unlike the legacy path, a parse failure in one template
+	// does not discard the other templates: it is recorded and parsing
+	// continues so that every broken template is reported.
+	parsed := make(map[string]bool, len(keys))
+	var failures []RenderFailure
+	for _, filename := range keys {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			failures = append(failures, contextRenderFailure(filename, RenderStageParse, false, ctxErr))
+			continue
+		}
+		r := tpls[filename]
+		if parseErr := guardedParse(t, filename, r.tpl); parseErr != nil {
+			failures = append(failures, RenderFailure{
+				Path:   filename,
+				Stage:  RenderStageParse,
+				Reason: cleanupParseError(filename, parseErr),
+			})
+			continue
+		}
+		parsed[filename] = true
+	}
+
+	// Execute phase.
+	for _, filename := range keys {
+		// Don't render partials. We don't care about the direct output of
+		// partials. They are only included from other templates.
+		if strings.HasPrefix(path.Base(filename), "_") {
+			continue
+		}
+		// A template that could not be parsed has already been recorded and
+		// must not be executed.
+		if !parsed[filename] {
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			failures = append(failures, contextRenderFailure(filename, RenderStageExecute, false, ctxErr))
+			continue
+		}
+		// At render time, add information about the template that is being rendered.
+		vals := tpls[filename].vals
+		vals["Template"] = common.Values{"Name": filename, "BasePath": tpls[filename].basePath}
+		var buf strings.Builder
+		execErr, timedOut := executeTemplate(ctx, t, &buf, filename, vals)
+		if timedOut {
+			failures = append(failures, contextRenderFailure(filename, RenderStageExecute, true, execErr))
+			continue
+		}
+		if execErr != nil {
+			failures = append(failures, RenderFailure{
+				Path:   filename,
+				Stage:  RenderStageExecute,
+				Reason: reformatExecErrorMsg(filename, execErr),
+			})
+			continue
+		}
+
+		// Work around the issue where Go will emit "<no value>" even if Options(missing=zero)
+		// is set. Since missing=error will never get here, we do not need to handle
+		// the Strict case.
+		result.Files[filename] = strings.ReplaceAll(buf.String(), "<no value>", "")
+	}
+
+	result.Failures = failures
+	if len(failures) > 0 {
+		renderErr := &RenderError{Failures: failures}
+		if !opts.PartialResults {
+			// Preserve the historical overall-failure behavior: without
+			// partial products there is nothing usable to return.
+			result.Files = map[string]string{}
+		}
+		return result, renderErr
+	}
+
+	return result, nil
+}
+
+// guardedParse parses text as a new named template in t, converting a panic
+// into an error so that one pathological template does not abort the entire
+// render walk.
+func guardedParse(t *template.Template, filename, text string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("rendering template failed: %v", r)
+		}
+	}()
+	_, err = t.New(filename).Parse(text)
+	return err
+}
+
+// executeTemplate executes a single template without waiting past ctx.
+//
+// text/template execution itself is synchronous and cannot be interrupted,
+// so it runs in a goroutine. When ctx is done first, executeTemplate stops
+// waiting for the in-flight execution and reports the context error with
+// timedOut=true; the goroutine is left to finish on its own. Template
+// functions that honor ctx (such as 'lookup') return as soon as the render
+// deadline cancels the context.
+func executeTemplate(ctx context.Context, t *template.Template, buf *strings.Builder, filename string, data any) (error, bool) {
+	resultCh := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				resultCh <- fmt.Errorf("rendering template failed: %v", r)
+			}
+		}()
+		resultCh <- t.ExecuteTemplate(buf, filename, data)
+	}()
+
+	select {
+	case execErr := <-resultCh:
+		return execErr, false
+	case <-ctx.Done():
+		return ctx.Err(), true
+	}
+}
+
+// contextRenderFailure builds a RenderFailure for a template that was not
+// rendered because the render context ended. Deadline-driven endings are
+// marked as timeouts; other cancellations are reported as plain failures.
+func contextRenderFailure(filename string, stage RenderStage, started bool, cause error) RenderFailure {
+	if cause == nil {
+		cause = context.Canceled
+	}
+	timedOut := errors.Is(cause, context.DeadlineExceeded)
+
+	var message string
+	switch {
+	case timedOut && stage == RenderStageParse:
+		message = fmt.Sprintf("render deadline exceeded before template %q was parsed", filename)
+	case timedOut && started:
+		message = fmt.Sprintf("render deadline exceeded while executing template %q", filename)
+	case timedOut:
+		message = fmt.Sprintf("render deadline exceeded before template %q was executed", filename)
+	case stage == RenderStageParse:
+		message = fmt.Sprintf("rendering cancelled before template %q was parsed", filename)
+	case started:
+		message = fmt.Sprintf("rendering cancelled while executing template %q", filename)
+	default:
+		message = fmt.Sprintf("rendering cancelled before template %q was executed", filename)
+	}
+
+	return RenderFailure{
+		Path:     filename,
+		Stage:    stage,
+		TimedOut: timedOut,
+		Reason:   fmt.Errorf("%s: %w", message, cause),
+	}
 }
 
 func cleanupParseError(filename string, err error) error {

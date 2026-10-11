@@ -124,6 +124,14 @@ type Install struct {
 	IsUpgrade bool
 	// Enable DNS lookups when rendering templates
 	EnableDNS bool
+	// RenderTimeout bounds the rendering of the chart templates, including
+	// subchart templates and nested 'tpl'/'include' rendering. Zero
+	// disables the render timeout.
+	RenderTimeout time.Duration
+	// RenderPartialResults keeps successfully rendered templates available
+	// in template/dry-run output even when other templates fail or the
+	// render timeout is reached; the operation is still reported as failed.
+	RenderPartialResults bool
 	// Used by helm template to add the release as part of OutputDir path
 	// OutputDir/<ReleaseName>
 	UseReleaseName bool
@@ -373,6 +381,11 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 	}
 
 	rel := i.createRelease(chrt, vals, i.Labels)
+
+	// Propagate the render configuration to the shared action configuration
+	// used by renderResources.
+	i.cfg.RenderTimeout = i.RenderTimeout
+	i.cfg.RenderPartialResults = i.RenderPartialResults
 
 	var manifestDoc *bytes.Buffer
 	rel.Hooks, manifestDoc, rel.Info.Notes, err = i.cfg.renderResources(ctx, chrt, valuesToRender, i.ReleaseName, i.OutputDir, i.SubNotes, i.UseReleaseName, i.IncludeCRDs, i.PostRenderer, interactWithServer(i.DryRunStrategy), i.EnableDNS, i.HideSecret, i.PostRenderStrategy)

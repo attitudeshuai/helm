@@ -133,6 +133,14 @@ type Upgrade struct {
 	Lock sync.Mutex
 	// Enable DNS lookups when rendering templates
 	EnableDNS bool
+	// RenderTimeout bounds the rendering of the chart templates, including
+	// subchart templates and nested 'tpl'/'include' rendering. Zero
+	// disables the render timeout.
+	RenderTimeout time.Duration
+	// RenderPartialResults keeps successfully rendered templates available
+	// in template/dry-run output even when other templates fail or the
+	// render timeout is reached; the operation is still reported as failed.
+	RenderPartialResults bool
 	// TakeOwnership will skip the check for helm annotations and adopt all existing resources.
 	TakeOwnership bool
 }
@@ -298,6 +306,11 @@ func (u *Upgrade) prepareUpgrade(ctx context.Context, name string, chart *chartv
 	if err != nil {
 		return nil, nil, false, err
 	}
+
+	// Propagate the render configuration to the shared action configuration
+	// used by renderResources.
+	u.cfg.RenderTimeout = u.RenderTimeout
+	u.cfg.RenderPartialResults = u.RenderPartialResults
 
 	hooks, manifestDoc, notesTxt, err := u.cfg.renderResources(ctx, chart, valuesToRender, "", "", u.SubNotes, false, false, u.PostRenderer, interactWithServer(u.DryRunStrategy), u.EnableDNS, u.HideSecret, u.PostRenderStrategy)
 	if err != nil {

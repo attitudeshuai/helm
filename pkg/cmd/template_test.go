@@ -18,8 +18,12 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var chartPath = "testdata/testcharts/subchart"
@@ -174,6 +178,53 @@ func TestTemplateCmd(t *testing.T) {
 		},
 	}
 	runTestCmd(t, tests)
+}
+
+func TestTemplateRenderTimeoutFlagValidation(t *testing.T) {
+	cases := []string{
+		"--render-timeout=0s",
+		"--render-timeout=-1s",
+		"--render-timeout=soon",
+		"--render-timeout=12",
+	}
+	for _, flag := range cases {
+		_, _, err := executeActionCommandC(storageFixture(), fmt.Sprintf("template %s '%s'", flag, chartPath))
+		require.Error(t, err, "expected %s to be rejected", flag)
+		assert.Contains(t, err.Error(), "invalid render timeout")
+	}
+
+	// A positive duration is accepted and does not change rendering output.
+	_, out, err := executeActionCommandC(storageFixture(), fmt.Sprintf("template '%s' --render-timeout=1h", chartPath))
+	require.NoError(t, err)
+	assert.Contains(t, out, "# Source:")
+}
+
+func TestTemplateRenderPartialResults(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "Chart.yaml"), []byte("apiVersion: v2\nname: partial\nversion: 0.1.0\n"), 0o600))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "templates"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "templates", "zz-good.yaml"),
+		[]byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: render-good\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "templates", "yy-bad.yaml"),
+		[]byte(`{{ fail "planned partial failure" }}`), 0o600))
+
+	// Without partial products a render failure keeps the historical
+	// behavior: the command fails and no manifest is printed.
+	_, out, err := executeActionCommandC(storageFixture(), fmt.Sprintf("template '%s'", dir))
+	require.Error(t, err)
+	assert.NotContains(t, out, "render-good")
+
+	// With partial products the command is still reported as failed and the
+	// complete failure list is returned, but the successful template is
+	// printed while the failed one stays absent.
+	_, partialOut, partialErr := executeActionCommandC(storageFixture(), fmt.Sprintf("template '%s' --render-partial", dir))
+	require.Error(t, partialErr)
+	assert.Contains(t, partialErr.Error(), "planned partial failure")
+	assert.Contains(t, partialOut, "name: render-good")
+	// The failure is reported (its path appears in the error text), but no
+	// product is emitted for the failed template.
+	assert.NotContains(t, partialOut, "# Source: partial/templates/yy-bad.yaml")
+	assert.Contains(t, partialOut, "execution error at (partial/templates/yy-bad.yaml")
 }
 
 func TestTemplateVersionCompletion(t *testing.T) {
