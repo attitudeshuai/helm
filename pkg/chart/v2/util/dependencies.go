@@ -33,7 +33,16 @@ func ProcessDependencies(c *chart.Chart, v common.Values) error {
 	if err := processDependencyEnabled(c, v, ""); err != nil {
 		return err
 	}
-	return processDependencyImportValues(c, true)
+	return processDependencyImportValues(c, true, nil)
+}
+
+// ProcessDependenciesWithProvenance behaves like ProcessDependencies but
+// records import-values sources on t.
+func ProcessDependenciesWithProvenance(c *chart.Chart, v common.Values, t *util.Tracker) error {
+	if err := processDependencyEnabled(c, v, ""); err != nil {
+		return err
+	}
+	return processDependencyImportValues(c, true, t)
 }
 
 // processDependencyConditions disables charts based on condition path value in values
@@ -249,14 +258,28 @@ func set(path []string, data map[string]any) map[string]any {
 }
 
 // processImportValues merges values from child to parent based on the chart's dependencies' ImportValues field.
-func processImportValues(c *chart.Chart, merge bool) error {
+//
+// When t is non-nil, imported leaves are tagged with import-values provenance
+// and the resulting shadow is registered for c so the final coalesce keeps the
+// import origin instead of treating them as plain chart defaults.
+func processImportValues(c *chart.Chart, merge bool, t *util.Tracker) error {
 	if c.Metadata.Dependencies == nil {
 		return nil
 	}
 	// combine chart values and empty config to get Values
 	var cvals common.Values
+	var cvalsN *util.ProvNode
 	var err error
-	if merge {
+	if t != nil {
+		// Auxiliary coalesce: only the chart shadow registration is shared.
+		aux := t.Aux()
+		if merge {
+			cvals, err = util.MergeValuesWithProvenance(c, nil, aux)
+		} else {
+			cvals, err = util.CoalesceValuesWithProvenance(c, nil, aux)
+		}
+		cvalsN = aux.Root()
+	} else if merge {
 		cvals, err = util.MergeValues(c, nil)
 	} else {
 		cvals, err = util.CoalesceValues(c, nil)
@@ -265,6 +288,10 @@ func processImportValues(c *chart.Chart, merge bool) error {
 		return err
 	}
 	b := make(map[string]any)
+	var bN *util.ProvNode
+	if t != nil {
+		bN = t.EmptyShadow()
+	}
 	// import values from each dependency if specified in import-values
 	for _, r := range c.Metadata.Dependencies {
 		var outiv []any
@@ -290,10 +317,14 @@ func processImportValues(c *chart.Chart, merge bool) error {
 					continue
 				}
 				// create value map from child to be merged into parent
-				if merge {
-					b = util.MergeTables(b, pathToMap(parent, vv.AsMap()))
+				mv := pathToMap(parent, vv.AsMap())
+				if t != nil {
+					importN := importShadow(t, cvalsN, r.Name+"."+child, parent, c.ChartFullPath(), child)
+					b, bN = t.CoalesceTablesTracked(b, mv, bN, importN, "", merge)
+				} else if merge {
+					b = util.MergeTables(b, mv)
 				} else {
-					b = util.CoalesceTables(b, pathToMap(parent, vv.AsMap()))
+					b = util.CoalesceTables(b, mv)
 				}
 			case string:
 				child := "exports." + iv
@@ -306,7 +337,10 @@ func processImportValues(c *chart.Chart, merge bool) error {
 					slog.Warn("ImportValues missing table", slog.Any("error", err))
 					continue
 				}
-				if merge {
+				if t != nil {
+					importN := importShadow(t, cvalsN, r.Name+"."+child, ".", c.ChartFullPath(), child)
+					b, bN = t.CoalesceTablesTracked(b, vm.AsMap(), bN, importN, "", merge)
+				} else if merge {
 					b = util.MergeTables(b, vm.AsMap())
 				} else {
 					b = util.CoalesceTables(b, vm.AsMap())
@@ -324,17 +358,48 @@ func processImportValues(c *chart.Chart, merge bool) error {
 		// deep copying the cvals as there are cases where pointers can end
 		// up in the cvals when they are copied onto b in ways that break things.
 		cvals = deepCopyMap(cvals)
-		c.Values = util.MergeTables(cvals, b)
+		if t != nil {
+			var resultN *util.ProvNode
+			cvals, resultN = t.CoalesceTablesTracked(cvals, b, cvalsN, bN, "", true)
+			t.RegisterChart(c, resultN)
+		} else {
+			c.Values = util.MergeTables(cvals, b)
+		}
 	} else {
 		// Trimming the nil values from cvals is needed for backwards compatibility.
 		// Previously, the b value had been populated with cvals along with some
 		// overrides. This caused the coalescing functionality to remove the
 		// nil/null values. This trimming is for backwards compat.
 		cvals = trimNilValues(cvals)
-		c.Values = util.CoalesceTables(cvals, b)
+		if t != nil {
+			t.TrimNilLeaves(cvalsN)
+			var resultN *util.ProvNode
+			cvals, resultN = t.CoalesceTablesTracked(cvals, b, cvalsN, bN, "", false)
+			t.RegisterChart(c, resultN)
+		} else {
+			c.Values = util.CoalesceTables(cvals, b)
+		}
+	}
+	if t != nil {
+		c.Values = cvals
 	}
 
 	return nil
+}
+
+// importShadow extracts the imported child subtree from the cvals shadow,
+// re-roots it at the parent target path and tags every leaf with the
+// import-values declaration location.
+func importShadow(t *util.Tracker, cvalsN *util.ProvNode, childPath, parent, chartFullPath, child string) *util.ProvNode {
+	n := t.SubNode(cvalsN, childPath)
+	if n == nil {
+		n = t.EmptyShadow()
+	} else {
+		n = n.Clone()
+	}
+	loc := fmt.Sprintf("%s/Chart.yaml: import-values %s -> %s", chartFullPath, child, parent)
+	t.TagSubtree(n, util.ValueSource{Category: util.SourceImport, Location: loc})
+	return t.RebaseShadow(n, parent)
 }
 
 func deepCopyMap(vals map[string]any) map[string]any {
@@ -371,12 +436,12 @@ func istable(v any) bool {
 }
 
 // processDependencyImportValues imports specified chart values from child to parent.
-func processDependencyImportValues(c *chart.Chart, merge bool) error {
+func processDependencyImportValues(c *chart.Chart, merge bool, t *util.Tracker) error {
 	for _, d := range c.Dependencies() {
 		// recurse
-		if err := processDependencyImportValues(d, merge); err != nil {
+		if err := processDependencyImportValues(d, merge, t); err != nil {
 			return err
 		}
 	}
-	return processImportValues(c, merge)
+	return processImportValues(c, merge, t)
 }

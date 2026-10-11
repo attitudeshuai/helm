@@ -56,6 +56,11 @@ func addValueOptionsFlags(f *pflag.FlagSet, v *values.Options) {
 	f.StringArrayVar(&v.LiteralValues, "set-literal", []string{}, "set a literal STRING value on the command line")
 }
 
+// addValueProvenanceFlag binds the --values-provenance diagnostic flag.
+func addValueProvenanceFlag(cmd *cobra.Command, enabled *bool) {
+	cmd.Flags().BoolVar(enabled, "values-provenance", false, "print the source (values files, --set arguments, chart defaults, parent overrides, globals, import-values or reused values) of every effective value, with its override chain, to stderr; does not change rendered output")
+}
+
 func AddWaitFlag(cmd *cobra.Command, wait *kube.WaitStrategy) {
 	cmd.Flags().Var(
 		newWaitValue(kube.HookOnlyStrategy, wait),

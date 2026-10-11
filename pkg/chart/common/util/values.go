@@ -34,6 +34,16 @@ func ToRenderValues(chrt chart.Charter, chrtVals map[string]any, options common.
 //
 // This takes both ReleaseOptions and Capabilities to merge into the render values.
 func ToRenderValuesWithSchemaValidation(chrt chart.Charter, chrtVals map[string]any, options common.ReleaseOptions, caps *common.Capabilities, skipSchemaValidation bool) (common.Values, error) {
+	return toRenderValues(chrt, chrtVals, options, caps, skipSchemaValidation, nil)
+}
+
+// ToRenderValuesWithProvenance behaves like ToRenderValuesWithSchemaValidation
+// but records value sources on t.
+func ToRenderValuesWithProvenance(chrt chart.Charter, chrtVals map[string]any, options common.ReleaseOptions, caps *common.Capabilities, skipSchemaValidation bool, t *Tracker) (common.Values, error) {
+	return toRenderValues(chrt, chrtVals, options, caps, skipSchemaValidation, t)
+}
+
+func toRenderValues(chrt chart.Charter, chrtVals map[string]any, options common.ReleaseOptions, caps *common.Capabilities, skipSchemaValidation bool, t *Tracker) (common.Values, error) {
 	if caps == nil {
 		caps = common.DefaultCapabilities
 	}
@@ -54,7 +64,12 @@ func ToRenderValuesWithSchemaValidation(chrt chart.Charter, chrtVals map[string]
 		},
 	}
 
-	vals, err := CoalesceValues(chrt, chrtVals)
+	var vals common.Values
+	if t != nil {
+		vals, err = CoalesceValuesWithProvenance(chrt, chrtVals, t)
+	} else {
+		vals, err = CoalesceValues(chrt, chrtVals)
+	}
 	if err != nil {
 		return common.Values(top), err
 	}

@@ -135,6 +135,12 @@ type Upgrade struct {
 	EnableDNS bool
 	// TakeOwnership will skip the check for helm annotations and adopt all existing resources.
 	TakeOwnership bool
+	// ValueProvenance, when non-nil, enables recording of every effective
+	// value leaf's source during the upgrade, including values reused from
+	// the previous release. The tracker is populated in place; nil preserves
+	// the default behavior, logging and performance. The report is never
+	// stored with the release.
+	ValueProvenance *util.Tracker
 }
 
 type resultMessage struct {
@@ -275,7 +281,11 @@ func (u *Upgrade) prepareUpgrade(ctx context.Context, name string, chart *chartv
 		return nil, nil, false, err
 	}
 
-	if err := chartutil.ProcessDependencies(chart, vals); err != nil {
+	if u.ValueProvenance != nil {
+		if err := chartutil.ProcessDependenciesWithProvenance(chart, vals, u.ValueProvenance); err != nil {
+			return nil, nil, false, err
+		}
+	} else if err := chartutil.ProcessDependencies(chart, vals); err != nil {
 		return nil, nil, false, err
 	}
 
@@ -294,7 +304,12 @@ func (u *Upgrade) prepareUpgrade(ctx context.Context, name string, chart *chartv
 	if err != nil {
 		return nil, nil, false, err
 	}
-	valuesToRender, err := util.ToRenderValuesWithSchemaValidation(chart, vals, options, caps, u.SkipSchemaValidation)
+	var valuesToRender common.Values
+	if u.ValueProvenance != nil {
+		valuesToRender, err = util.ToRenderValuesWithProvenance(chart, vals, options, caps, u.SkipSchemaValidation, u.ValueProvenance)
+	} else {
+		valuesToRender, err = util.ToRenderValuesWithSchemaValidation(chart, vals, options, caps, u.SkipSchemaValidation)
+	}
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -611,17 +626,37 @@ func (u *Upgrade) reuseValues(chart *chartv2.Chart, current *release.Release, ne
 		return newVals, nil
 	}
 
+	historySrc := util.ValueSource{Category: util.SourceHistory}
+
 	// If the ReuseValues flag is set, we always copy the old values over the new config's values.
 	if u.ReuseValues {
 		u.cfg.Logger().Debug("reusing the old release's values")
 
 		// We have to regenerate the old coalesced values:
-		oldVals, err := util.CoalesceValues(current.Chart, current.Config)
+		var oldVals map[string]any
+		var err error
+		if u.ValueProvenance != nil {
+			// Rebuild with an auxiliary tracker; historical values carry no
+			// source location, only their category.
+			aux := u.ValueProvenance.Aux()
+			aux.SetRoot(aux.ShadowForMap(current.Config, historySrc))
+			oldVals, err = util.CoalesceValuesWithProvenance(current.Chart, current.Config, aux)
+			if err == nil {
+				aux.MarkHistory(aux.Root())
+				u.ValueProvenance.RegisterChart(chart, aux.Root())
+				histN := u.ValueProvenance.ShadowForMap(current.Config, historySrc)
+				newVals, _ = u.ValueProvenance.CoalesceTablesTracked(newVals, current.Config,
+					u.ValueProvenance.Root(), histN, "", false)
+			}
+		} else {
+			oldVals, err = util.CoalesceValues(current.Chart, current.Config)
+			if err == nil {
+				newVals = util.CoalesceTables(newVals, current.Config)
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to rebuild old values: %w", err)
 		}
-
-		newVals = util.CoalesceTables(newVals, current.Config)
 
 		chart.Values = oldVals
 
@@ -632,7 +667,13 @@ func (u *Upgrade) reuseValues(chart *chartv2.Chart, current *release.Release, ne
 	if u.ResetThenReuseValues {
 		u.cfg.Logger().Debug("merging values from old release to new values")
 
-		newVals = util.CoalesceTables(newVals, current.Config)
+		if u.ValueProvenance != nil {
+			histN := u.ValueProvenance.ShadowForMap(current.Config, historySrc)
+			newVals, _ = u.ValueProvenance.CoalesceTablesTracked(newVals, current.Config,
+				u.ValueProvenance.Root(), histN, "", false)
+		} else {
+			newVals = util.CoalesceTables(newVals, current.Config)
+		}
 
 		return newVals, nil
 	}
@@ -640,6 +681,9 @@ func (u *Upgrade) reuseValues(chart *chartv2.Chart, current *release.Release, ne
 	if len(newVals) == 0 && len(current.Config) > 0 {
 		u.cfg.Logger().Debug("copying values from old release", "name", current.Name, "version", current.Version)
 		newVals = current.Config
+		if u.ValueProvenance != nil {
+			u.ValueProvenance.SetRoot(u.ValueProvenance.ShadowForMap(current.Config, historySrc))
+		}
 	}
 	return newVals, nil
 }

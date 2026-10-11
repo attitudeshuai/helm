@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"helm.sh/helm/v4/pkg/chart/common/util"
 	"helm.sh/helm/v4/pkg/getter"
 )
 
@@ -361,3 +362,90 @@ func TestMergeValuesCLI(t *testing.T) {
 		})
 	}
 }
+
+func findOptionRecord(rep *util.Report, path string) *util.ValueRecord {
+	sections := [][]util.ValueRecord{rep.Merged, rep.Replaced, rep.Removed}
+	for _, sec := range sections {
+		for i := range sec {
+			if sec[i].Path == path {
+				return &sec[i]
+			}
+		}
+	}
+	return nil
+}
+
+func TestMergeValuesWithProvenance(t *testing.T) {
+	tmpDir := t.TempDir()
+	valuesFile := filepath.Join(tmpDir, "vals.yaml")
+	require.NoError(t, os.WriteFile(valuesFile, []byte("a: fromfile\nover: fileval\nnested:\n  x: 1\n"), 0o644))
+
+	opts := Options{
+		ValueFiles:   []string{valuesFile},
+		Values:       []string{"over=setval", "setonly=1"},
+		StringValues: []string{"str=007"},
+		JSONValues:   []string{`{"j":"v"}`},
+	}
+
+	// Tracked values must equal the untracked merge exactly.
+	expected, err := opts.MergeValues(getter.Providers{})
+	require.NoError(t, err)
+
+	tr := util.NewTracker()
+	got, err := opts.MergeValuesWithProvenance(getter.Providers{}, tr)
+	require.NoError(t, err)
+	assert.Equal(t, expected, got)
+
+	rep := tr.Report()
+
+	a := findOptionRecord(rep, "a")
+	require.NotNil(t, a)
+	assert.Equal(t, util.SourceValuesFile, a.Final.Category)
+	assert.Equal(t, valuesFile, a.Final.Location)
+
+	// File value overridden by --set: full chain in the replaced section.
+	over := findOptionRecord(rep, "over")
+	require.NotNil(t, over)
+	assert.True(t, over.Replaced)
+	require.Len(t, over.Sources, 2)
+	assert.Equal(t, util.SourceValuesFile, over.Sources[0].Category)
+	assert.Equal(t, util.SourceSet, over.Final.Category)
+	assert.Contains(t, over.Final.Location, "--set[0]")
+
+	nested := findOptionRecord(rep, "nested.x")
+	require.NotNil(t, nested)
+	assert.False(t, nested.Replaced)
+	assert.Equal(t, util.SourceValuesFile, nested.Final.Category)
+
+	setonly := findOptionRecord(rep, "setonly")
+	require.NotNil(t, setonly)
+	assert.Equal(t, util.SourceSet, setonly.Final.Category)
+	assert.Contains(t, setonly.Final.Location, "--set[1]")
+
+	str := findOptionRecord(rep, "str")
+	require.NotNil(t, str)
+	assert.Equal(t, util.SourceSetString, str.Final.Category)
+
+	j := findOptionRecord(rep, "j")
+	require.NotNil(t, j)
+	assert.Equal(t, util.SourceSetJSON, j.Final.Category)
+}
+
+func TestMergeValuesWithProvenanceSetFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	dataFile := filepath.Join(tmpDir, "payload.txt")
+	require.NoError(t, os.WriteFile(dataFile, []byte("payload"), 0o644))
+
+	opts := Options{FileValues: []string{"key=" + filepath.ToSlash(dataFile)}}
+	tr := util.NewTracker()
+	got, err := opts.MergeValuesWithProvenance(getter.Providers{}, tr)
+	require.NoError(t, err)
+	assert.Equal(t, "payload", got["key"])
+
+	rep := tr.Report()
+	rec := findOptionRecord(rep, "key")
+	require.NotNil(t, rec)
+	assert.Equal(t, util.SourceSetFile, rec.Final.Category)
+	assert.Contains(t, rec.Final.Location, "--set-file[0]")
+}
+

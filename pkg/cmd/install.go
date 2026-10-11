@@ -32,6 +32,7 @@ import (
 
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/chart"
+	"helm.sh/helm/v4/pkg/chart/common/util"
 	"helm.sh/helm/v4/pkg/chart/loader"
 	"helm.sh/helm/v4/pkg/cli/output"
 	"helm.sh/helm/v4/pkg/cli/values"
@@ -134,6 +135,7 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	client.WaitOptions = append(client.WaitOptions, defaultCLIWaitOptions()...)
 	valueOpts := &values.Options{}
 	var outfmt output.Format
+	var provenanceEnabled bool
 
 	cmd := &cobra.Command{
 		Use:   "install [NAME] [CHART]",
@@ -157,7 +159,12 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			}
 			client.DryRunStrategy = dryRunStrategy
 
-			rel, err := runInstall(args, client, valueOpts, out)
+			var prov *util.Tracker
+			if provenanceEnabled {
+				prov = util.NewTracker()
+			}
+			rel, err := runInstall(args, client, valueOpts, out, prov)
+			writeValueProvenanceReport(cmd, prov)
 			if err != nil {
 				return fmt.Errorf("INSTALLATION FAILED: %w", err)
 			}
@@ -178,10 +185,22 @@ func newInstallCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	// it is added separately
 	f.BoolVar(&client.HideSecret, "hide-secret", false, "hide Kubernetes Secrets when also using the --dry-run flag")
 	addDryRunFlag(cmd)
+	addValueProvenanceFlag(cmd, &provenanceEnabled)
 	bindOutputFlag(cmd, &outfmt)
 	bindPostRenderFlag(cmd, &client.PostRenderer, settings)
 
 	return cmd
+}
+
+// writeValueProvenanceReport prints the provenance report to stderr when
+// tracking is enabled, leaving stdout unchanged.
+func writeValueProvenanceReport(cmd *cobra.Command, t *util.Tracker) {
+	if t == nil {
+		return
+	}
+	if report := t.Report().String(); report != "" {
+		fmt.Fprint(cmd.ErrOrStderr(), report)
+	}
 }
 
 func addInstallFlags(cmd *cobra.Command, f *pflag.FlagSet, client *action.Install, valueOpts *values.Options) {
@@ -252,7 +271,7 @@ func addInstallFlags(cmd *cobra.Command, f *pflag.FlagSet, client *action.Instal
 	}
 }
 
-func runInstall(args []string, client *action.Install, valueOpts *values.Options, out io.Writer) (*release.Release, error) {
+func runInstall(args []string, client *action.Install, valueOpts *values.Options, out io.Writer, prov *util.Tracker) (*release.Release, error) {
 	slog.Debug("Original chart version", "version", client.Version)
 	if client.Version == "" && client.Devel {
 		slog.Debug("setting version to >0.0.0-0")
@@ -273,7 +292,12 @@ func runInstall(args []string, client *action.Install, valueOpts *values.Options
 	slog.Debug("Chart path", "path", cp)
 
 	p := getter.All(settings)
-	vals, err := valueOpts.MergeValues(p)
+	var vals map[string]any
+	if prov != nil {
+		vals, err = valueOpts.MergeValuesWithProvenance(p, prov)
+	} else {
+		vals, err = valueOpts.MergeValues(p)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -349,6 +373,7 @@ func runInstall(args []string, client *action.Install, valueOpts *values.Options
 		cancel()
 	}()
 
+	client.ValueProvenance = prov
 	ri, err := client.RunWithContext(ctx, chartRequested, vals)
 	rel, rerr := releaserToV1Release(ri)
 	if rerr != nil {

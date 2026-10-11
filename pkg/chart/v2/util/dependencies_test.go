@@ -1,4 +1,4 @@
-/*
+﻿/*
 Copyright The Helm Authors.
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -206,7 +206,7 @@ func TestProcessDependencyImportValues(t *testing.T) {
 	e["SCBexported2A"] = "blaster"
 	e["global.SC1exported2.all.SC1exported3"] = "SC1expstr"
 
-	require.NoErrorf(t, processDependencyImportValues(c, false), "processing import values dependencies")
+	require.NoErrorf(t, processDependencyImportValues(c, false, nil), "processing import values dependencies")
 	cc := common.Values(c.Values)
 	for kk, vv := range e {
 		pv, err := cc.PathValue(kk)
@@ -232,7 +232,7 @@ func TestProcessDependencyImportValues(t *testing.T) {
 	require.ErrorAs(t, err, &xerr, "expected an ErrNoValue")
 
 	c = loadChart(t, "testdata/subpop")
-	require.NoErrorf(t, processDependencyImportValues(c, true), "processing import values dependencies")
+	require.NoErrorf(t, processDependencyImportValues(c, true, nil), "processing import values dependencies")
 	cc = common.Values(c.Values)
 	val, err := cc.PathValue("ensurenull")
 	require.NoError(t, err, "expect value but ensurenull was not found")
@@ -243,7 +243,7 @@ func TestProcessDependencyImportValuesFromSharedDependencyToAliases(t *testing.T
 	c := loadChart(t, "testdata/chart-with-import-from-aliased-dependencies")
 
 	require.NoErrorf(t, processDependencyEnabled(c, c.Values, ""), "expected no errors")
-	require.NoErrorf(t, processDependencyImportValues(c, true), "processing import values dependencies")
+	require.NoErrorf(t, processDependencyImportValues(c, true, nil), "processing import values dependencies")
 	e := make(map[string]string)
 
 	e["foo-defaults.defaultValue"] = "42"
@@ -286,7 +286,7 @@ func TestProcessDependencyImportValuesMultiLevelPrecedence(t *testing.T) {
 	e["app2.service.port"] = "8080"
 	e["app3.service.port"] = "9090"
 	e["app4.service.port"] = "1234"
-	require.NoErrorf(t, processDependencyImportValues(c, true), "processing import values dependencies")
+	require.NoErrorf(t, processDependencyImportValues(c, true, nil), "processing import values dependencies")
 	cc := common.Values(c.Values)
 	for kk, vv := range e {
 		pv, err := cc.PathValue(kk)
@@ -306,7 +306,7 @@ func TestProcessDependencyImportValuesForEnabledCharts(t *testing.T) {
 	c := loadChart(t, "testdata/import-values-from-enabled-subchart/parent-chart")
 	nameOverride := "parent-chart-prod"
 
-	require.NoErrorf(t, processDependencyImportValues(c, true), "processing import values dependencies")
+	require.NoErrorf(t, processDependencyImportValues(c, true, nil), "processing import values dependencies")
 	require.Len(t, c.Dependencies(), 2, "expected 2 dependencies for this chart, but got %d", len(c.Dependencies()))
 	require.NoErrorf(t, processDependencyEnabled(c, c.Values, ""), "expected no errors")
 	require.Len(t, c.Dependencies(), 1, "expected no changes in dependencies")

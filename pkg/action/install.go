@@ -137,6 +137,13 @@ type Install struct {
 	// Lock to control raceconditions when the process receives a SIGTERM
 	Lock           sync.Mutex
 	goroutineCount atomic.Int32
+
+	// ValueProvenance, when non-nil, enables recording of every effective
+	// value leaf's source (values files, --set arguments, chart defaults,
+	// parent overrides, globals and import-values) during the install. The
+	// tracker is populated in place; nil preserves the default behavior,
+	// logging and performance. The report is never stored with the release.
+	ValueProvenance *util.Tracker
 }
 
 // ChartPathOptions captures common options used for controlling chart paths
@@ -310,7 +317,12 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 		return nil, fmt.Errorf("release name check failed: %w", err)
 	}
 
-	if err := chartutil.ProcessDependencies(chrt, vals); err != nil {
+	if i.ValueProvenance != nil {
+		if err := chartutil.ProcessDependenciesWithProvenance(chrt, vals, i.ValueProvenance); err != nil {
+			i.cfg.Logger().Error("chart dependencies processing failed", slog.Any("error", err))
+			return nil, fmt.Errorf("chart dependencies processing failed: %w", err)
+		}
+	} else if err := chartutil.ProcessDependencies(chrt, vals); err != nil {
 		i.cfg.Logger().Error("chart dependencies processing failed", slog.Any("error", err))
 		return nil, fmt.Errorf("chart dependencies processing failed: %w", err)
 	}
@@ -363,7 +375,12 @@ func (i *Install) RunWithContext(ctx context.Context, ch ci.Charter, vals map[st
 		IsInstall: !isUpgrade,
 		IsUpgrade: isUpgrade,
 	}
-	valuesToRender, err := util.ToRenderValuesWithSchemaValidation(chrt, vals, options, caps, i.SkipSchemaValidation)
+	var valuesToRender common.Values
+	if i.ValueProvenance != nil {
+		valuesToRender, err = util.ToRenderValuesWithProvenance(chrt, vals, options, caps, i.SkipSchemaValidation, i.ValueProvenance)
+	} else {
+		valuesToRender, err = util.ToRenderValuesWithSchemaValidation(chrt, vals, options, caps, i.SkipSchemaValidation)
+	}
 	if err != nil {
 		return nil, err
 	}

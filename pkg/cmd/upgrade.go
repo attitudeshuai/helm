@@ -32,6 +32,7 @@ import (
 
 	"helm.sh/helm/v4/pkg/action"
 	ci "helm.sh/helm/v4/pkg/chart"
+	"helm.sh/helm/v4/pkg/chart/common/util"
 	"helm.sh/helm/v4/pkg/chart/loader"
 	"helm.sh/helm/v4/pkg/cli/output"
 	"helm.sh/helm/v4/pkg/cli/values"
@@ -88,6 +89,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	valueOpts := &values.Options{}
 	var outfmt output.Format
 	var createNamespace bool
+	var provenanceEnabled bool
 
 	cmd := &cobra.Command{
 		Use:   "upgrade [RELEASE] [CHART]",
@@ -118,6 +120,11 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 				return err
 			}
 			client.DryRunStrategy = dryRunStrategy
+
+			var prov *util.Tracker
+			if provenanceEnabled {
+				prov = util.NewTracker()
+			}
 
 			// Fixes #7002 - Support reading values from STDIN for `upgrade` command
 			// Must load values AFTER determining if we have to call install so that values loaded from stdin are not read twice
@@ -163,7 +170,8 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 						instClient.Replace = true
 					}
 
-					rel, err := runInstall(args, instClient, valueOpts, out)
+					rel, err := runInstall(args, instClient, valueOpts, out, prov)
+					writeValueProvenanceReport(cmd, prov)
 					if err != nil {
 						return err
 					}
@@ -190,7 +198,12 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			}
 
 			p := getter.All(settings)
-			vals, err := valueOpts.MergeValues(p)
+			var vals map[string]any
+			if prov != nil {
+				vals, err = valueOpts.MergeValuesWithProvenance(p, prov)
+			} else {
+				vals, err = valueOpts.MergeValues(p)
+			}
 			if err != nil {
 				return err
 			}
@@ -257,7 +270,9 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 				cancel()
 			}()
 
+			client.ValueProvenance = prov
 			rel, err := client.RunWithContext(ctx, args[0], ch, vals)
+			writeValueProvenanceReport(cmd, prov)
 			if err != nil {
 				return fmt.Errorf("UPGRADE FAILED: %w", err)
 			}
@@ -310,6 +325,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	addDryRunFlag(cmd)
 	addChartPathOptionsFlags(f, &client.ChartPathOptions)
 	addValueOptionsFlags(f, valueOpts)
+	addValueProvenanceFlag(cmd, &provenanceEnabled)
 	bindOutputFlag(cmd, &outfmt)
 	bindPostRenderFlag(cmd, &client.PostRenderer, settings)
 	AddWaitFlag(cmd, &client.WaitStrategy)

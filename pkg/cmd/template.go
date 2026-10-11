@@ -35,6 +35,7 @@ import (
 
 	"helm.sh/helm/v4/pkg/action"
 	"helm.sh/helm/v4/pkg/chart/common"
+	"helm.sh/helm/v4/pkg/chart/common/util"
 	"helm.sh/helm/v4/pkg/cli/values"
 	"helm.sh/helm/v4/pkg/cmd/require"
 	releaseutil "helm.sh/helm/v4/pkg/release/v1/util"
@@ -62,6 +63,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	var validate bool
 	var includeCrds bool
 	var skipTests bool
+	var provenanceEnabled bool
 	client := action.NewInstall(cfg)
 	valueOpts := &values.Options{}
 	var kubeVersion string
@@ -105,7 +107,12 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 			client.Replace = true // Skip the name check
 			client.APIVersions = common.VersionSet(extraAPIs)
 			client.IncludeCRDs = includeCrds
-			rel, err := runInstall(args, client, valueOpts, out)
+			var prov *util.Tracker
+			if provenanceEnabled {
+				prov = util.NewTracker()
+			}
+			rel, err := runInstall(args, client, valueOpts, out, prov)
+			writeValueProvenanceReport(cmd, prov)
 
 			if err != nil && !settings.Debug {
 				if rel != nil {
@@ -218,6 +225,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
 	f.StringVar(&kubeVersion, "kube-version", "", "Kubernetes version used for Capabilities.KubeVersion")
 	f.StringSliceVarP(&extraAPIs, "api-versions", "a", []string{}, "Kubernetes api versions used for Capabilities.APIVersions (multiple can be specified)")
 	f.BoolVar(&client.UseReleaseName, "release-name", false, "use release name in the output-dir path.")
+	addValueProvenanceFlag(cmd, &provenanceEnabled)
 	f.String(
 		"dry-run",
 		"client",
