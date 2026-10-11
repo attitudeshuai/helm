@@ -92,31 +92,57 @@ type EnvSettings struct {
 	ColorMode string
 	// ContentCache is the location where cached charts are stored
 	ContentCache string
+	// StrictSettings fails instead of silently falling back to the default
+	// when a CLI setting has an invalid value.
+	StrictSettings bool
+
+	// flags is the flag set the settings were bound to through AddFlags. It is
+	// used after parsing to determine which values came from command-line flags.
+	flags *pflag.FlagSet
+	// prov records every source observed while resolving the setting values.
+	prov *provenance
 }
 
 func New() *EnvSettings {
+	prov := newProvenance()
+
+	// Resolve the path-derived defaults once, through the same path helpers
+	// that the commands use, so that the provenance report can point at the
+	// path variable (HELM_*_HOME or XDG_*_HOME) that shaped each default.
+	pluginsPath, pluginsOrigin := helmpath.DataPathOrigin("plugins")
+	registryPath, registryOrigin := helmpath.ConfigPathOrigin("registry/config.json")
+	repositoryPath, repositoryOrigin := helmpath.ConfigPathOrigin("repositories.yaml")
+	repoCachePath, repoCacheOrigin := helmpath.CachePathOrigin("repository")
+	contentCachePath, contentCacheOrigin := helmpath.CachePathOrigin("content")
+	prov.setPathDefault("HELM_PLUGINS", pluginsOrigin)
+	prov.setPathDefault("HELM_REGISTRY_CONFIG", registryOrigin)
+	prov.setPathDefault("HELM_REPOSITORY_CONFIG", repositoryOrigin)
+	prov.setPathDefault("HELM_REPOSITORY_CACHE", repoCacheOrigin)
+	prov.setPathDefault("HELM_CONTENT_CACHE", contentCacheOrigin)
+
 	env := &EnvSettings{
-		namespace:                 os.Getenv("HELM_NAMESPACE"),
-		MaxHistory:                envIntOr("HELM_MAX_HISTORY", defaultMaxHistory),
-		KubeConfig:                os.Getenv("KUBECONFIG"),
-		KubeContext:               os.Getenv("HELM_KUBECONTEXT"),
-		KubeToken:                 os.Getenv("HELM_KUBETOKEN"),
-		KubeAsUser:                os.Getenv("HELM_KUBEASUSER"),
-		KubeAsGroups:              envCSV("HELM_KUBEASGROUPS"),
-		KubeAPIServer:             os.Getenv("HELM_KUBEAPISERVER"),
-		KubeCaFile:                os.Getenv("HELM_KUBECAFILE"),
-		KubeTLSServerName:         os.Getenv("HELM_KUBETLS_SERVER_NAME"),
-		KubeInsecureSkipTLSVerify: envBoolOr("HELM_KUBEINSECURE_SKIP_TLS_VERIFY", false),
-		PluginsDirectory:          envOr("HELM_PLUGINS", helmpath.DataPath("plugins")),
-		RegistryConfig:            envOr("HELM_REGISTRY_CONFIG", helmpath.ConfigPath("registry/config.json")),
-		RepositoryConfig:          envOr("HELM_REPOSITORY_CONFIG", helmpath.ConfigPath("repositories.yaml")),
-		RepositoryCache:           envOr("HELM_REPOSITORY_CACHE", helmpath.CachePath("repository")),
-		ContentCache:              envOr("HELM_CONTENT_CACHE", helmpath.CachePath("content")),
-		BurstLimit:                envIntOr("HELM_BURST_LIMIT", defaultBurstLimit),
-		QPS:                       envFloat32Or("HELM_QPS", defaultQPS),
-		ColorMode:                 envColorMode(),
+		namespace:                 prov.envString("HELM_NAMESPACE", "HELM_NAMESPACE"),
+		MaxHistory:                prov.envInt("HELM_MAX_HISTORY", "HELM_MAX_HISTORY", defaultMaxHistory),
+		KubeConfig:                prov.envString("KUBECONFIG", "KUBECONFIG"),
+		KubeContext:               prov.envString("HELM_KUBECONTEXT", "HELM_KUBECONTEXT"),
+		KubeToken:                 prov.envString("HELM_KUBETOKEN", "HELM_KUBETOKEN"),
+		KubeAsUser:                prov.envString("HELM_KUBEASUSER", "HELM_KUBEASUSER"),
+		KubeAsGroups:              prov.envCSV("HELM_KUBEASGROUPS", "HELM_KUBEASGROUPS"),
+		KubeAPIServer:             prov.envString("HELM_KUBEAPISERVER", "HELM_KUBEAPISERVER"),
+		KubeCaFile:                prov.envString("HELM_KUBECAFILE", "HELM_KUBECAFILE"),
+		KubeTLSServerName:         prov.envString("HELM_KUBETLS_SERVER_NAME", "HELM_KUBETLS_SERVER_NAME"),
+		KubeInsecureSkipTLSVerify: prov.envBool("HELM_KUBEINSECURE_SKIP_TLS_VERIFY", "HELM_KUBEINSECURE_SKIP_TLS_VERIFY", false),
+		PluginsDirectory:          prov.envPathString("HELM_PLUGINS", "HELM_PLUGINS", pluginsPath),
+		RegistryConfig:            prov.envPathString("HELM_REGISTRY_CONFIG", "HELM_REGISTRY_CONFIG", registryPath),
+		RepositoryConfig:          prov.envPathString("HELM_REPOSITORY_CONFIG", "HELM_REPOSITORY_CONFIG", repositoryPath),
+		RepositoryCache:           prov.envPathString("HELM_REPOSITORY_CACHE", "HELM_REPOSITORY_CACHE", repoCachePath),
+		ContentCache:              prov.envPathString("HELM_CONTENT_CACHE", "HELM_CONTENT_CACHE", contentCachePath),
+		BurstLimit:                prov.envInt("HELM_BURST_LIMIT", "HELM_BURST_LIMIT", defaultBurstLimit),
+		QPS:                       prov.envFloat("HELM_QPS", "HELM_QPS", defaultQPS),
+		ColorMode:                 prov.envColor(),
+		Debug:                     prov.envBool("HELM_DEBUG", "HELM_DEBUG", false),
+		prov:                      prov,
 	}
-	env.Debug, _ = strconv.ParseBool(os.Getenv("HELM_DEBUG"))
 
 	// bind to kubernetes config flags
 	config := &genericclioptions.ConfigFlags{
@@ -150,6 +176,7 @@ func New() *EnvSettings {
 
 // AddFlags binds flags to the given flagset.
 func (s *EnvSettings) AddFlags(fs *pflag.FlagSet) {
+	s.flags = fs
 	fs.StringVarP(&s.namespace, "namespace", "n", s.namespace, "namespace scope for this request")
 	fs.StringVar(&s.KubeConfig, "kubeconfig", "", "path to the kubeconfig file")
 	fs.StringVar(&s.KubeContext, "kube-context", s.KubeContext, "name of the kubeconfig context to use")
@@ -169,74 +196,22 @@ func (s *EnvSettings) AddFlags(fs *pflag.FlagSet) {
 	fs.Float32Var(&s.QPS, "qps", s.QPS, "queries per second used when communicating with the Kubernetes API, not including bursting")
 	fs.StringVar(&s.ColorMode, "color", s.ColorMode, "use colored output (never, auto, always)")
 	fs.StringVar(&s.ColorMode, "colour", s.ColorMode, "use colored output (never, auto, always)")
-}
-
-func envOr(name, def string) string {
-	if v, ok := os.LookupEnv(name); ok {
-		return v
-	}
-	return def
+	fs.BoolVar(&s.StrictSettings, "strict-settings", false, "fail when a CLI setting has an invalid value instead of silently falling back to its default")
 }
 
 func envBoolOr(name string, def bool) bool {
 	if name == "" {
 		return def
 	}
-	envVal := envOr(name, strconv.FormatBool(def))
+	envVal, ok := os.LookupEnv(name)
+	if !ok || envVal == "" {
+		return def
+	}
 	ret, err := strconv.ParseBool(envVal)
 	if err != nil {
 		return def
 	}
 	return ret
-}
-
-func envIntOr(name string, def int) int {
-	if name == "" {
-		return def
-	}
-	envVal := envOr(name, strconv.Itoa(def))
-	ret, err := strconv.Atoi(envVal)
-	if err != nil {
-		return def
-	}
-	return ret
-}
-
-func envFloat32Or(name string, def float32) float32 {
-	if name == "" {
-		return def
-	}
-	envVal := envOr(name, strconv.FormatFloat(float64(def), 'f', 2, 32))
-	ret, err := strconv.ParseFloat(envVal, 32)
-	if err != nil {
-		return def
-	}
-	return float32(ret)
-}
-
-func envCSV(name string) (ls []string) {
-	trimmed := strings.Trim(os.Getenv(name), ", ")
-	if trimmed != "" {
-		ls = strings.Split(trimmed, ",")
-	}
-	return ls
-}
-
-func envColorMode() string {
-	// Check NO_COLOR environment variable first (standard)
-	if v, ok := os.LookupEnv("NO_COLOR"); ok && v != "" {
-		return "never"
-	}
-	// Check HELM_COLOR environment variable
-	if v, ok := os.LookupEnv("HELM_COLOR"); ok {
-		v = strings.ToLower(v)
-		switch v {
-		case "never", "auto", "always":
-			return v
-		}
-	}
-	// Default to auto
-	return "auto"
 }
 
 func (s *EnvSettings) EnvVars() map[string]string {

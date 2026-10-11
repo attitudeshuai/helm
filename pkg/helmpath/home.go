@@ -20,11 +20,26 @@ const lp = lazypath("helm")
 // ConfigPath returns the path where Helm stores configuration.
 func ConfigPath(elem ...string) string { return lp.configPath(elem...) }
 
+// ConfigPathOrigin works like ConfigPath but additionally reports where the
+// base directory originated (HELM_CONFIG_HOME, XDG_CONFIG_HOME or the built-in
+// operating system default).
+func ConfigPathOrigin(elem ...string) (string, PathOrigin) { return lp.configPathOrigin(elem...) }
+
 // CachePath returns the path where Helm stores cached objects.
 func CachePath(elem ...string) string { return lp.cachePath(elem...) }
 
+// CachePathOrigin works like CachePath but additionally reports where the
+// base directory originated (HELM_CACHE_HOME, XDG_CACHE_HOME or the built-in
+// operating system default).
+func CachePathOrigin(elem ...string) (string, PathOrigin) { return lp.cachePathOrigin(elem...) }
+
 // DataPath returns the path where Helm stores data.
 func DataPath(elem ...string) string { return lp.dataPath(elem...) }
+
+// DataPathOrigin works like DataPath but additionally reports where the
+// base directory originated (HELM_DATA_HOME, XDG_DATA_HOME or the built-in
+// operating system default).
+func DataPathOrigin(elem ...string) (string, PathOrigin) { return lp.dataPathOrigin(elem...) }
 
 // CacheIndexFile returns the path to an index for the given named repository.
 func CacheIndexFile(name string) string {

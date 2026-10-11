@@ -198,6 +198,18 @@ func newRootCmdWithConfig(actionConfig *action.Configuration, out io.Writer, arg
 		return nil, fmt.Errorf("invalid color mode %q: must be one of: never, auto, always", settings.ColorMode)
 	}
 
+	// In strict mode, invalid setting values fail the command instead of
+	// silently falling back to the built-in default.
+	if settings.StrictSettings {
+		if diagnostics := settings.Validate(); len(diagnostics) > 0 {
+			lines := make([]string, 0, len(diagnostics))
+			for _, diagnostic := range diagnostics {
+				lines = append(lines, diagnostic.String())
+			}
+			return nil, fmt.Errorf("invalid CLI setting values: %s; fix the values or rerun without --strict-settings (\"helm settings\" shows every source)", strings.Join(lines, "; "))
+		}
+	}
+
 	// Configure color output based on ColorMode setting
 	configureColorOutput(settings)
 
@@ -289,6 +301,7 @@ func newRootCmdWithConfig(actionConfig *action.Configuration, out io.Writer, arg
 
 		newCompletionCmd(out),
 		newEnvCmd(out),
+		newSettingsCmd(out),
 		newPluginCmd(out),
 		newVersionCmd(out),
 
