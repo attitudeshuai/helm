@@ -34,6 +34,13 @@ tampered with, and was packaged by a trusted provider.
 This command can be used to verify a local chart. Several other commands provide
 '--verify' flags that run the same validation. To generate a signed package, use
 the 'helm package --sign' command.
+
+Verification can additionally follow a policy that merges several keyring files
+and key directories (each key keeps its source annotation), admits or rejects
+signing identities and fingerprints, requires signature annotations, and
+requires a minimum number of valid signatures spread across distinct sources.
+Policy files are merged in the order given and command-line flags take
+precedence over policy files. See '--verify-policy' and the related flags.
 `
 
 func newVerifyCmd(out io.Writer) *cobra.Command {
@@ -52,7 +59,8 @@ func newVerifyCmd(out io.Writer) *cobra.Command {
 			// No more completions, so disable file completion
 			return noMoreArgsComp()
 		},
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client.KeyringExplicit = cmd.Flags().Changed("keyring")
 			result, err := client.Run(args[0])
 			if err != nil {
 				return err
@@ -64,7 +72,32 @@ func newVerifyCmd(out io.Writer) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&client.Keyring, "keyring", defaultKeyring(), "keyring containing public keys")
+	f := cmd.Flags()
+	f.StringVar(&client.Keyring, "keyring", defaultKeyring(), "keyring containing public keys")
+	f.StringArrayVar(&client.PolicyFiles, "verify-policy", nil,
+		"verification policy file to use (can be specified multiple times; merged in order)")
+	f.StringArrayVar(&client.ExtraKeyrings, "extra-keyring", nil,
+		"additional keyring file to merge for verification (can be specified multiple times)")
+	f.StringArrayVar(&client.KeyDirs, "key-dir", nil,
+		"directory of keyring files to merge for verification (can be specified multiple times)")
+	f.StringArrayVar(&client.IdentityAllow, "allow-identity", nil,
+		"admit only signatures by identities matching the entry (exact or glob; can be specified multiple times); overrides policy files")
+	f.StringArrayVar(&client.IdentityDeny, "deny-identity", nil,
+		"reject signatures by identities matching the entry (exact or glob; can be specified multiple times); overrides policy files")
+	f.StringArrayVar(&client.IdentityRequiredPatterns, "require-identity-pattern", nil,
+		"require the signer identity to match this regular expression (can be specified multiple times); overrides policy files")
+	f.StringArrayVar(&client.FingerprintAllow, "allow-fingerprint", nil,
+		"admit only signatures by these key fingerprints (full fingerprint or key-id suffix; repeatable); overrides policy files")
+	f.StringArrayVar(&client.FingerprintDeny, "deny-fingerprint", nil,
+		"reject signatures by these key fingerprints (full fingerprint or key-id suffix; repeatable); overrides policy files")
+	f.StringArrayVar(&client.FingerprintRequiredPatterns, "require-fingerprint-pattern", nil,
+		"require the signer fingerprint to match this regular expression (repeatable); overrides policy files")
+	f.IntVar(&client.MinValidSignatures, "min-valid-signatures", 0,
+		"minimum number of valid, admitted signatures required (default 1 when a policy is in force); overrides policy files")
+	f.IntVar(&client.MinDistinctSources, "min-distinct-sources", 0,
+		"minimum number of distinct key sources the valid signatures must come from; overrides policy files")
+	f.StringToStringVar(&client.RequiredAnnotations, "require-annotation", nil,
+		"require a signature annotation (OpenPGP notation) key=value (repeatable); overrides policy files")
 
 	return cmd
 }

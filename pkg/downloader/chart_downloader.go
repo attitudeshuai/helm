@@ -485,18 +485,9 @@ func (c *ChartDownloader) ResolveChartVersion(ref, version string) (string, *url
 // It assumes that a chart archive file is accompanied by a provenance file whose
 // name is the archive file name plus the ".prov" extension.
 func VerifyChart(path, provfile, keyring string) (*provenance.Verification, error) {
-	// For now, error out if it's not a tar file.
-	switch fi, err := os.Stat(path); {
-	case err != nil:
+	archiveData, provData, err := readChartAndProvenance(path, provfile)
+	if err != nil {
 		return nil, err
-	case fi.IsDir():
-		return nil, errors.New("unpacked charts cannot be verified")
-	case !isTar(path):
-		return nil, errors.New("chart must be a tgz file")
-	}
-
-	if _, err := os.Stat(provfile); err != nil {
-		return nil, fmt.Errorf("could not load provenance file %s: %w", provfile, err)
 	}
 
 	sig, err := provenance.NewFromKeyring(keyring, "")
@@ -504,17 +495,47 @@ func VerifyChart(path, provfile, keyring string) (*provenance.Verification, erro
 		return nil, fmt.Errorf("failed to load keyring: %w", err)
 	}
 
+	return sig.Verify(archiveData, provData, filepath.Base(path))
+}
+
+// VerifyChartWithPolicy verifies a chart using a policy signatory built from
+// several key sources and an admission policy. It shares the archive and
+// provenance checks with VerifyChart.
+func VerifyChartWithPolicy(path, provfile string, sig *provenance.PolicySignatory) (*provenance.PolicyVerification, error) {
+	archiveData, provData, err := readChartAndProvenance(path, provfile)
+	if err != nil {
+		return nil, err
+	}
+	return sig.VerifyPolicy(archiveData, provData, filepath.Base(path))
+}
+
+// readChartAndProvenance validates the chart archive location and reads the
+// archive and provenance bytes.
+func readChartAndProvenance(path, provfile string) ([]byte, []byte, error) {
+	// For now, error out if it's not a tar file.
+	switch fi, err := os.Stat(path); {
+	case err != nil:
+		return nil, nil, err
+	case fi.IsDir():
+		return nil, nil, errors.New("unpacked charts cannot be verified")
+	case !isTar(path):
+		return nil, nil, errors.New("chart must be a tgz file")
+	}
+
+	if _, err := os.Stat(provfile); err != nil {
+		return nil, nil, fmt.Errorf("could not load provenance file %s: %w", provfile, err)
+	}
+
 	// Read archive and provenance files
 	archiveData, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read chart archive: %w", err)
+		return nil, nil, fmt.Errorf("failed to read chart archive: %w", err)
 	}
 	provData, err := os.ReadFile(provfile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read provenance file: %w", err)
+		return nil, nil, fmt.Errorf("failed to read provenance file: %w", err)
 	}
-
-	return sig.Verify(archiveData, provData, filepath.Base(path))
+	return archiveData, provData, nil
 }
 
 // isTar tests whether the given file is a tar file.

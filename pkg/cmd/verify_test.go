@@ -90,3 +90,35 @@ func TestVerifyFileCompletion(t *testing.T) {
 	checkFileCompletion(t, "verify", true)
 	checkFileCompletion(t, "verify mypath", false)
 }
+
+func TestVerifyCmdPolicyFlags(t *testing.T) {
+	const chart = "testdata/testcharts/signtest-0.1.0.tgz"
+	const keyring = "testdata/helm-test-key.pub"
+
+	// Extra keyring activates policy machinery but imposes no admission: the
+	// legacy lines survive verbatim and the policy supplement is appended.
+	_, out, err := executeActionCommand(
+		"verify " + chart + " --extra-keyring " + keyring)
+	require.NoError(t, err, out)
+	assert.Contains(t, out, "Signed by: Helm Testing")
+	assert.Contains(t, out, "Chart Hash Verified:")
+	assert.Contains(t, out, "Verification Policy:")
+	assert.Contains(t, out, "Key Sources Counted: 1")
+	assert.Contains(t, out, "Judged Signatures:")
+	assert.Contains(t, out, "Result: verification passed")
+
+	// A command-line deny list rejects an otherwise verifiable signer.
+	_, out, err = executeActionCommand(
+		"verify " + chart + " --extra-keyring " + keyring + " --deny-identity helm-testing@helm.sh")
+	require.Error(t, err, out)
+	assert.Contains(t, err.Error(), "signer-forbidden")
+	assert.Contains(t, err.Error(), "helm-testing@helm.sh")
+	assert.Contains(t, err.Error(), "from command-line")
+
+	// A minimum valid signature threshold not met fails separately.
+	_, out, err = executeActionCommand(
+		"verify " + chart + " --extra-keyring " + keyring + " --min-valid-signatures 2")
+	require.Error(t, err, out)
+	assert.Contains(t, err.Error(), "insufficient-signatures")
+	assert.Contains(t, err.Error(), "found 1")
+}
